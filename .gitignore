@@ -1,0 +1,36 @@
+# LeRobot (separate repo, cloned here)
+lerobot/
+
+# Recorded trajectories (can be large)
+trajectories/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Conda / venv
+.conda/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated docs
+docs/*.gif
