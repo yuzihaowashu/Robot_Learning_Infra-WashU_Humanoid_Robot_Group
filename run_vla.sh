@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 # ##################################################################################################
-# ATTENTION: Zero-shot without any training might lead to arms collide with body! Control C to quit! 
+# ATTENTION: Zero-shot without any training might lead to arms CRUSH with body! Control C to quit! 
 # ##################################################################################################
 #
 # G1 VLA Inference — GR00T N1.6
 # First, on Remote Robot Controller, run:
-# (1) L2 + Y and L2 + B 
+# (1) L2 + Y and L2 + B (press L2 until feel it shake; press button once and suddenly release L2)
 # (2) L2 + UP --> Joints move to home position slowly
 # (3) R1 + X  --> balance controller will be activated and the robot will stand up!
 # 
@@ -17,11 +17,14 @@
 # Usage:
 #   bash run_vla.sh server                          # Terminal 1: GPU inference server
 #   bash run_vla.sh client --task "pick up apple"   # Terminal 2: step-by-step (default, safe)
+# Usage for continuous mode (Smooth but DANGEROUS!):
 #   bash run_vla.sh client --continuous              # Terminal 2: auto-execute (dangerous!)
+# Debug mode:
 #   bash run_vla.sh client --dry-run                 # Terminal 2: inference only, no robot cmd
 # 
-# Other commands: 
+# Other Remote Robot Controller Commands: 
 # (1) L2 + Left --> Sit down
+#
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,8 +75,8 @@ except:
 
     export SSHPASS="$ROBOT_PASS"
     SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR"
-    SSH_CMD="sshpass -e ssh ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP}"
-    SCP_CMD="sshpass -e scp ${SSH_OPTS}"
+    SSH_CMD="env LD_LIBRARY_PATH= sshpass -e ssh ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP}"
+    SCP_CMD="env LD_LIBRARY_PATH= sshpass -e scp ${SSH_OPTS}"
 
     $SSH_CMD "pkill -f robot_camera_server.py 2>/dev/null" || true
 
@@ -86,7 +89,7 @@ except:
         $SSH_CMD "pip3 install pyzmq"
     }
 
-    sshpass -e ssh -T ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} \
+    env LD_LIBRARY_PATH= sshpass -e ssh -T ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} \
         "setsid python3 ${REMOTE_DIR}/robot_camera_server.py \
            --device -1 --port ${CAMERA_PORT} \
            >${REMOTE_DIR}/camera_server.log 2>&1 </dev/null &"

@@ -47,8 +47,8 @@ if [ "$SKIP_CAMERA" = false ]; then
 
     export SSHPASS="$ROBOT_PASS"
     SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR"
-    SSH="sshpass -e ssh ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP}"
-    SCP="sshpass -e scp ${SSH_OPTS}"
+    SSH="env LD_LIBRARY_PATH= sshpass -e ssh ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP}"
+    SCP="env LD_LIBRARY_PATH= sshpass -e scp ${SSH_OPTS}"
 
     # Check if camera server is already running
     EXISTING=$($SSH "pgrep -f robot_camera_server.py" 2>/dev/null || true)
@@ -70,7 +70,7 @@ if [ "$SKIP_CAMERA" = false ]; then
     }
 
     echo "[Camera] Starting (device=${DEVICE_ID})..."
-    sshpass -e ssh -T ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} \
+    env LD_LIBRARY_PATH= sshpass -e ssh -T ${SSH_OPTS} ${ROBOT_USER}@${ROBOT_IP} \
         "setsid python3 ${REMOTE_DIR}/robot_camera_server.py \
            --device ${DEVICE_ID} --port ${CAMERA_PORT} \
            >${REMOTE_DIR}/camera_server.log 2>&1 </dev/null &"
@@ -109,7 +109,7 @@ if [ "$SKIP_CAMERA" = false ] && [ -n "$RUNNING" ]; then
         read -sp "Robot SSH password: " ROBOT_PASS
         echo ""
         export SSHPASS="$ROBOT_PASS"
-        SSH="sshpass -e ssh -o StrictHostKeyChecking=no ${ROBOT_USER}@${ROBOT_IP}"
+        SSH="env LD_LIBRARY_PATH= sshpass -e ssh -o StrictHostKeyChecking=no ${ROBOT_USER}@${ROBOT_IP}"
         $SSH "pkill -f robot_camera_server.py 2>/dev/null" && \
             echo "Camera server stopped." || echo "Already stopped."
         unset SSHPASS

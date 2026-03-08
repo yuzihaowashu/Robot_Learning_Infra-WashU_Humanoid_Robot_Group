@@ -8,6 +8,7 @@ and run Vision-Language-Action (VLA) inference via NVIDIA GR00T N1.6.
 | Feature | Entry Point | Docs |
 |---------|-------------|------|
 | **VLA Inference** — GR00T N1.6 zero-shot control | `bash run_vla.sh` | [docs/vla_inference.md](docs/vla_inference.md) |
+| **Data Collection** — Record LeRobot datasets from demos | `bash run_collect.sh` | [docs/data_collection.md](docs/data_collection.md) |
 | **Drag-and-Teach** — Record & replay arm trajectories | `bash run_teach.sh` | [docs/teach_and_replay.md](docs/teach_and_replay.md) |
 | **Dashboard** — Real-time GUI with camera, joints, tactile | `bash run_dashboard.sh` | [docs/dashboard.md](docs/dashboard.md) |
 | **Tactile Sensors** — Dex3 pressure sensor visualization | Integrated in dashboard | [docs/tactile_sensors.md](docs/tactile_sensors.md) |
@@ -34,17 +35,22 @@ bash run_vla.sh client --task "pick up the apple and place on plate"
 Step-by-step mode shows each action's target angles in degrees and waits
 for your approval before execution. See [VLA docs](docs/vla_inference.md).
 
-### 2. Drag-and-Teach
+### 2. Drag-and-Teach + Data Collection
 
 ```bash
-# Record: move arms freely, gravity-compensated
+# Step 1: Record trajectories by physically moving the arms
 bash run_teach.sh record
 
-# Replay a saved trajectory
-bash run_teach.sh replay trajectories/traj_20260306_174754.json
+# Step 2: Collect LeRobot dataset by replaying trajectories
+bash run_collect.sh --task "pick up the apple" trajectories/traj_*.json
+
+# Step 3: Visualize the dataset locally
+python -m lerobot.scripts.lerobot_dataset_viz \
+    --repo-id yuzihaowashu/g1_pick_apple --root ./datasets/...
 ```
 
-See [Teach & Replay docs](docs/teach_and_replay.md).
+See [Teach & Replay docs](docs/teach_and_replay.md) and
+[Data Collection docs](docs/data_collection.md).
 
 ### 3. Dashboard
 
@@ -75,6 +81,7 @@ After usage:
 ```
 chongjie.zhang/
 ├── run_vla.sh                    # VLA inference (server + client)
+├── run_collect.sh                # Data collection (replay → LeRobot)
 ├── run_teach.sh                  # Drag-and-teach (record + replay)
 ├── run_dashboard.sh              # GUI dashboard + camera
 ├── trajectories/                 # Saved trajectory JSON files
@@ -82,12 +89,14 @@ chongjie.zhang/
 ├── lerobot/                      # [submodule] HuggingFace LeRobot
 ├── docs/
 │   ├── vla_inference.md          # VLA pipeline details
+│   ├── data_collection.md        # Dataset collection from demos
 │   ├── teach_and_replay.md       # Drag-and-teach details
 │   ├── dashboard.md              # Dashboard GUI details
 │   ├── tactile_sensors.md        # Dex3 tactile sensor details
 │   └── setup_and_arm_control.md  # Low-level SDK and joint reference
 └── utils/
     ├── vla_client.py             # GR00T ↔ G1 bridge (DDS + ZMQ)
+    ├── collect_dataset.py        # LeRobot dataset collection
     ├── dashboard.py              # Tkinter GUI (joints, camera, tactile)
     ├── teach.py                  # Drag-and-teach recorder
     ├── replay.py                 # Trajectory replay with gravity comp.

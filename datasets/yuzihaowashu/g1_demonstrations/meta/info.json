@@ -1,0 +1,190 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": "unitree_g1",
+    "total_episodes": 1,
+    "total_frames": 1485,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 200,
+    "fps": 30,
+    "splits": {
+        "train": "0:1"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "features": {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                29
+            ],
+            "names": {
+                "motors": [
+                    "left_hip_pitch",
+                    "left_hip_roll",
+                    "left_hip_yaw",
+                    "left_knee",
+                    "left_ankle_pitch",
+                    "left_ankle_roll",
+                    "right_hip_pitch",
+                    "right_hip_roll",
+                    "right_hip_yaw",
+                    "right_knee",
+                    "right_ankle_pitch",
+                    "right_ankle_roll",
+                    "waist_yaw",
+                    "waist_roll",
+                    "waist_pitch",
+                    "left_shoulder_pitch",
+                    "left_shoulder_roll",
+                    "left_shoulder_yaw",
+                    "left_elbow",
+                    "left_wrist_roll",
+                    "left_wrist_pitch",
+                    "left_wrist_yaw",
+                    "right_shoulder_pitch",
+                    "right_shoulder_roll",
+                    "right_shoulder_yaw",
+                    "right_elbow",
+                    "right_wrist_roll",
+                    "right_wrist_pitch",
+                    "right_wrist_yaw"
+                ]
+            }
+        },
+        "observation.hand": {
+            "dtype": "float32",
+            "shape": [
+                14
+            ],
+            "names": {
+                "motors": [
+                    "left_thumb_0",
+                    "left_thumb_1",
+                    "left_thumb_2",
+                    "left_index_0",
+                    "left_index_1",
+                    "left_middle_0",
+                    "left_middle_1",
+                    "right_thumb_0",
+                    "right_thumb_1",
+                    "right_thumb_2",
+                    "right_index_0",
+                    "right_index_1",
+                    "right_middle_0",
+                    "right_middle_1"
+                ]
+            }
+        },
+        "observation.images.ego_view": {
+            "dtype": "video",
+            "shape": [
+                480,
+                640,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 30,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                17
+            ],
+            "names": {
+                "motors": [
+                    "waist_yaw",
+                    "waist_roll",
+                    "waist_pitch",
+                    "left_shoulder_pitch",
+                    "left_shoulder_roll",
+                    "left_shoulder_yaw",
+                    "left_elbow",
+                    "left_wrist_roll",
+                    "left_wrist_pitch",
+                    "left_wrist_yaw",
+                    "right_shoulder_pitch",
+                    "right_shoulder_roll",
+                    "right_shoulder_yaw",
+                    "right_elbow",
+                    "right_wrist_roll",
+                    "right_wrist_pitch",
+                    "right_wrist_yaw"
+                ]
+            }
+        },
+        "action.hand": {
+            "dtype": "float32",
+            "shape": [
+                14
+            ],
+            "names": {
+                "motors": [
+                    "left_thumb_0",
+                    "left_thumb_1",
+                    "left_thumb_2",
+                    "left_index_0",
+                    "left_index_1",
+                    "left_middle_0",
+                    "left_middle_1",
+                    "right_thumb_0",
+                    "right_thumb_1",
+                    "right_thumb_2",
+                    "right_index_0",
+                    "right_index_1",
+                    "right_middle_0",
+                    "right_middle_1"
+                ]
+            }
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}
