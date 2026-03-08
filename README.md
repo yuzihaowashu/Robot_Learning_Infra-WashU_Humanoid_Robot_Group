@@ -1,141 +1,147 @@
-# Unitree G1 Arm & Hand Control Workspace
+# WashU Humanoid Robot Group — Unitree G1 Infrastructure
 
-Control the Unitree G1 humanoid robot's dual arms and Dex3-1 dexterous hands
-via the Unitree SDK2 Python interface.
+Control the Unitree G1 humanoid robot's dual arms, Dex3-1 dexterous hands,
+and run Vision-Language-Action (VLA) inference via NVIDIA GR00T N1.6.
+
+## Features
+
+| Feature | Entry Point | Docs |
+|---------|-------------|------|
+| **VLA Inference** — GR00T N1.6 zero-shot control | `bash run_vla.sh` | [docs/vla_inference.md](docs/vla_inference.md) |
+| **Drag-and-Teach** — Record & replay arm trajectories | `bash run_teach.sh` | [docs/teach_and_replay.md](docs/teach_and_replay.md) |
+| **Dashboard** — Real-time GUI with camera, joints, tactile | `bash run_dashboard.sh` | [docs/dashboard.md](docs/dashboard.md) |
+| **Tactile Sensors** — Dex3 pressure sensor visualization | Integrated in dashboard | [docs/tactile_sensors.md](docs/tactile_sensors.md) |
+| **Setup & Arm Control** — Low-level SDK, joint maps, limits | — | [docs/setup_and_arm_control.md](docs/setup_and_arm_control.md) |
 
 ## Quick Start
 
 ### Prerequisites
 
-- Conda environment `lerobot` (Python 3.12)
-- Unitree SDK2 Python installed (`pip install -e /home/humanoid-pc/unitree_sdk2_python`)
-- Robot powered on and connected (default IP: `192.168.123.164`)
+- Conda environment `lerobot` (Python 3.12) with Unitree SDK2, Pinocchio
+- GR00T `uv` venv (Python 3.10) at `Isaac-GR00T/.venv` (for VLA only)
+- Robot powered on and connected (IP: `192.168.123.164`)
 
-### 1. Drag-and-Teach (Record & Replay)
-
-Physically move the robot's arms and fingers, record the trajectory, then replay it.
+### 1. VLA Inference (GR00T N1.6)
 
 ```bash
-# Record a new trajectory
-#   - Robot must be standing (use hand controller: L1+A → L1+UP)
-#   - Arms become compliant — move them freely
-#   - Gravity compensation keeps arms weightless
-#   - Press [Enter] to start/stop recording, Ctrl+C to quit
+# Terminal 1: Start GPU inference server (loads model, ~30s)
+bash run_vla.sh server
+
+# Terminal 2: Start robot client (step-by-step approval by default)
+bash run_vla.sh client --task "pick up the apple and place on plate"
+```
+
+Step-by-step mode shows each action's target angles in degrees and waits
+for your approval before execution. See [VLA docs](docs/vla_inference.md).
+
+### 2. Drag-and-Teach
+
+```bash
+# Record: move arms freely, gravity-compensated
 bash run_teach.sh record
 
 # Replay a saved trajectory
 bash run_teach.sh replay trajectories/traj_20260306_174754.json
-
-# Replay at half speed, loop 3 times
-bash run_teach.sh replay trajectories/traj_xxx.json --speed 0.5 --loop 3
-
-# List all saved trajectories
-bash run_teach.sh list
 ```
 
-**How it works:**
-- Uses `rt/arm_sdk` to overlay arm control on Unitree's balance controller
-  (legs and body stay balanced, push-resistant)
-- Arms: `kp=0, kd=1` during teach (compliant), `kp=80, kd=2` during replay
-- Gravity compensation via Pinocchio dynamics (`tau_ff = G(q)` from URDF)
-- Hands: controlled via `rt/dex3/left/cmd` and `rt/dex3/right/cmd` (7 DOF each)
-- Fingers open automatically on exit
+See [Teach & Replay docs](docs/teach_and_replay.md).
 
-### 2. Dashboard (GUI)
-
-Real-time monitoring dashboard with camera feed, joint visualization, and
-predefined arm actions.
+### 3. Dashboard
 
 ```bash
-# Full launch: deploys camera server to robot + opens dashboard
+# Launch with auto camera setup
 bash run_dashboard.sh
-
-# Skip camera setup (dashboard only)
-bash run_dashboard.sh --no-camera
-
-# Specify camera device on robot
-bash run_dashboard.sh --device 4
 ```
 
-**Features:**
-- Live camera stream from robot (ZMQ-based, deployed automatically)
-- Real-time joint angle display for all 29 body motors
-- Predefined action buttons (Safe Home, Wave, Arms Up, etc.)
-- SSH password prompt for automatic camera server deployment
+See [Dashboard docs](docs/dashboard.md).
+
+## Robot Controller Sequence
+
+Before any arm control, the robot must be standing with the balance controller active:
+
+```
+Remote Controller:
+  (1) L2 + Y  and  L2 + B    — Power on
+  (2) L2 + UP                 — Joints to home position
+  (3) R1 + X                  — Activate balance controller (robot stands)
+
+After usage:
+  (1) L2 + UP                 — Home position (no controller)
+  (2) L2 + B                  — Power off (MUST BE HANGED!)
+```
 
 ## Project Structure
 
 ```
 chongjie.zhang/
-├── run_teach.sh                  # Entry point: drag-and-teach
-├── run_dashboard.sh              # Entry point: GUI dashboard + camera
-├── trajectories/                 # Recorded trajectory JSON files
+├── run_vla.sh                    # VLA inference (server + client)
+├── run_teach.sh                  # Drag-and-teach (record + replay)
+├── run_dashboard.sh              # GUI dashboard + camera
+├── trajectories/                 # Saved trajectory JSON files
+├── Isaac-GR00T/                  # [submodule] NVIDIA GR00T N1.6
+├── lerobot/                      # [submodule] HuggingFace LeRobot
 ├── docs/
-│   ├── setup_and_arm_control.md  # Detailed technical documentation
-│   └── g1_arm_workspace.gif      # Arm workspace visualization
-├── lerobot/                      # LeRobot repo (v0.4.5, for future VLA)
+│   ├── vla_inference.md          # VLA pipeline details
+│   ├── teach_and_replay.md       # Drag-and-teach details
+│   ├── dashboard.md              # Dashboard GUI details
+│   ├── tactile_sensors.md        # Dex3 tactile sensor details
+│   └── setup_and_arm_control.md  # Low-level SDK and joint reference
 └── utils/
-    ├── teach.py                  # Drag-and-teach recorder (arm_sdk + dex3)
-    ├── replay.py                 # Trajectory replay with gravity compensation
-    ├── dashboard.py              # Tkinter GUI dashboard
-    ├── robot_camera_server.py    # Camera server (deployed to robot via SSH)
+    ├── vla_client.py             # GR00T ↔ G1 bridge (DDS + ZMQ)
+    ├── dashboard.py              # Tkinter GUI (joints, camera, tactile)
+    ├── teach.py                  # Drag-and-teach recorder
+    ├── replay.py                 # Trajectory replay with gravity comp.
+    ├── robot_camera_server.py    # Camera server (deployed to robot)
+    ├── test_tactile.py           # Raw tactile sensor debugging
     ├── arm_demo.py               # Choreographed arm motion sequences
-    ├── visualize_workspace.py    # Arm workspace envelope (Pinocchio + URDF)
+    ├── visualize_workspace.py    # Arm workspace envelope (URDF)
     ├── test_arm_control.py       # Basic arm control test
-    ├── start_camera.sh           # Manual camera server start
-    ├── stop_camera.sh            # Manual camera server stop
-    ├── explore_robot.sh          # Robot filesystem exploration via SSH
-    └── run_arm_test.sh           # Arm demo launcher
+    ├── start_camera.sh           # Manual camera start
+    └── stop_camera.sh            # Manual camera stop
 ```
 
-## Architecture Overview
-
-### Control Modes
-
-| Mode | Topic | Use Case |
-|------|-------|----------|
-| **arm_sdk** | `rt/arm_sdk` | Arm overlay on balance controller (robot standing) |
-| **lowcmd** | `rt/lowcmd` | Direct motor control (robot hanging / full body) |
-| **dex3 hands** | `rt/dex3/{left,right}/cmd` | Dexterous hand control (7 motors each) |
-
-### Communication Stack
+## Architecture
 
 ```
-Host PC (this machine)
-  ├── DDS (CycloneDDS) ──────── rt/arm_sdk ──────→ G1 locomotion overlay
-  ├── DDS ───────────────────── rt/lowstate ←───── G1 motor feedback
-  ├── DDS ───────────────────── rt/dex3/*/cmd ──→ Dex3-1 hand motors
-  ├── RPC (via DDS) ─────────── MotionSwitcher ──→ Mode management
-  └── ZMQ (tcp:5555) ←───────── Camera server ──── Robot onboard camera
+                        ┌─────────────────────────────────┐
+                        │    Host PC (RTX 4080, 16GB)     │
+                        │                                 │
+  ┌─────────────┐       │  ┌───────────┐   ┌───────────┐ │
+  │ GR00T N1.6  │◄─ZMQ──┤  │VLA Client │   │ Dashboard │ │
+  │ PolicyServer│──────►─┤  │(vla_client│   │(dashboard │ │
+  │  (GPU)      │       │  │   .py)    │   │   .py)    │ │
+  └─────────────┘       │  └─────┬─────┘   └─────┬─────┘ │
+                        │        │                │       │
+                        │   DDS  │           DDS  │       │
+                        └────────┼────────────────┼───────┘
+                                 │                │
+                        ┌────────▼────────────────▼───────┐
+                        │         Unitree G1 Robot        │
+                        │  rt/arm_sdk ← arm commands      │
+                        │  rt/lowstate → joint feedback    │
+                        │  rt/dex3/*/cmd ← hand commands  │
+                        │  rt/dex3/*/state → tactile data │
+                        │  ZMQ:5555 → camera stream       │
+                        └─────────────────────────────────┘
 ```
-
-### Key Technical Details
-
-- **Gravity compensation**: Pinocchio computes `G(q)` from the URDF at each
-  control step. This torque is sent as `tau_ff` (feedforward) to counteract
-  gravity, making arms weightless during teaching and droop-free during replay.
-- **Dex3 hand protocol**: Each hand has 7 motors. The `mode` field uses RIS
-  encoding: `motor_id | (status << 4) | (timeout << 7)`. Default gains:
-  `kp=1.5, kd=0.2`.
-- **CRC**: Every `LowCmd_` message requires a valid CRC checksum or the robot
-  ignores it.
-- **Balance**: When using `rt/arm_sdk`, the robot must be in `ai` mode
-  (activated via hand controller L1+A, L1+UP). The locomotion controller
-  manages legs and body while arm_sdk overlays arm commands.
 
 ## Environment
 
 | Component | Version / Path |
 |-----------|---------------|
 | Conda env | `lerobot` (Python 3.12) |
+| GR00T venv | `Isaac-GR00T/.venv` (Python 3.10, uv) |
 | Unitree SDK2 | `/home/humanoid-pc/unitree_sdk2_python` |
 | URDF | `/home/humanoid-pc/unitree_rl_gym/resources/robots/g1_description/` |
-| LeRobot | `./lerobot/` (v0.4.5) |
-| Pinocchio | Installed in conda env (dynamics + kinematics) |
+| GPU | NVIDIA RTX 4080 (16GB), CUDA 12.6, flash-attn 2.7.4 |
 | Robot SSH | `unitree@192.168.123.164` |
 
-## Next Steps
+## Cloning This Repo
 
-- [ ] Integrate VLA model for autonomous arm control
-- [ ] Add hand trajectory recording (Dex3 state subscription)
-- [ ] Deploy trained policy end-to-end (camera → VLA → arm_sdk)
+```bash
+git clone --recurse-submodules https://github.com/yuzihaowashu/WashU_Humanoid_Robot_Group_Infrastructure.git
+cd WashU_Humanoid_Robot_Group_Infrastructure
+
+# If already cloned without submodules:
+git submodule update --init
+```

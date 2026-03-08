@@ -1,4 +1,7 @@
-# Unitree G1 Arm Control — Setup & Guide
+# Setup & Arm Control — Low-Level SDK Reference
+
+> See also: [VLA Inference](vla_inference.md) | [Teach & Replay](teach_and_replay.md) |
+> [Dashboard](dashboard.md) | [Tactile Sensors](tactile_sensors.md)
 
 ## Machine Overview
 
@@ -202,29 +205,41 @@ bash utils/stop_camera.sh          # stop
 - **LeRobot on robot**: v0.3.4 in `/home/unitree/miniconda3/envs/unifolm-vla/`
 - **SSH**: `unitree@192.168.123.164`
 
-## Repository Structure
+## GR00T VLA Environment (Python 3.10)
 
+The GR00T inference server requires a separate environment due to Python
+version constraints (3.10 required by flash-attn):
+
+```bash
+cd Isaac-GR00T
+uv sync --python 3.10
 ```
-chongjie.zhang/
-├── run_dashboard.sh              # Main entry: camera + dashboard
-├── run_teach.sh                  # Drag-and-teach: record & replay
-├── trajectories/                 # Saved trajectory JSON files
-├── docs/
-│   └── setup_and_arm_control.md
-├── lerobot/                      # LeRobot repo (v0.4.5)
-└── utils/
-    ├── dashboard.py              # GUI dashboard (joints, camera, actions)
-    ├── teach.py                  # Drag-and-teach recorder
-    ├── replay.py                 # Trajectory replay
-    ├── robot_camera_server.py    # Camera server (deployed to robot)
-    ├── start_camera.sh           # Camera deploy/start helper
-    ├── stop_camera.sh            # Camera stop helper
-    ├── explore_robot.sh          # Robot filesystem explorer
-    ├── arm_demo.py               # Choreographed arm motions
-    ├── test_arm_control.py       # Basic arm control test
-    ├── run_arm_test.sh           # Arm test launcher
-    └── visualize_workspace.py    # Arm workspace visualization (GIF)
+
+Key packages: PyTorch 2.7+ (CUDA 12.6), flash-attn 2.7.4, transformers,
+unitree-sdk2py (installed in the venv for the client).
+
+## Dex3 Hand Protocol
+
+Each hand has 7 motors. Commands sent via `rt/dex3/{left,right}/cmd`
+using `HandCmd_` messages.
+
+### RIS Mode Encoding
+```python
+mode = motor_id | (status << 4) | (timeout << 7)
+# status: 0x01 = enabled
+# timeout: 0 = no timeout
 ```
+
+### Hand Topics
+
+| Topic | Type | Direction |
+|-------|------|-----------|
+| `rt/dex3/left/cmd` | `HandCmd_` | PC → Robot |
+| `rt/dex3/right/cmd` | `HandCmd_` | PC → Robot |
+| `rt/dex3/left/state` | `HandState_` | Robot → PC |
+| `rt/dex3/right/state` | `HandState_` | Robot → PC |
+
+See [Tactile Sensors](tactile_sensors.md) for pressure sensor details.
 
 ## Key External Paths
 
