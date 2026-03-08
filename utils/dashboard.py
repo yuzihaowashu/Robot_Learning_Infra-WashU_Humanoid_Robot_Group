@@ -38,7 +38,9 @@ from unitree_sdk2py.core.channel import (
     ChannelSubscriber,
 )
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
+    LowCmd_, LowState_, HandState_,
+)
 from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
@@ -131,6 +133,18 @@ ACTIONS = {
 
 ROBOT_IP = "192.168.123.164"
 CAMERA_ZMQ_PORT = 5555
+
+TOPIC_LEFT_HAND_STATE = "rt/dex3/left/state"
+TOPIC_RIGHT_HAND_STATE = "rt/dex3/right/state"
+N_HAND_SENSORS = 9
+N_PRESS_PER_SENSOR = 12
+
+PRESS_BASELINE = 30000.0
+PRESS_MAX = 120000.0
+
+HAND_SENSOR_NAMES = [
+    "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8",
+]
 
 KP = 30.0
 KD = 1.5
@@ -227,6 +241,12 @@ class RobotController:
         self.joint_torques = {j: 0.0 for j in ALL_ARM_JOINTS}
         self.imu_rpy = [0.0, 0.0, 0.0]
 
+        self.left_hand_state = None
+        self.right_hand_state = None
+        self.left_pressures = [[PRESS_BASELINE] * N_PRESS_PER_SENSOR for _ in range(N_HAND_SENSORS)]
+        self.right_pressures = [[PRESS_BASELINE] * N_PRESS_PER_SENSOR for _ in range(N_HAND_SENSORS)]
+        self.hand_lock = threading.Lock()
+
         self.is_controlling = False
         self.action_queue = []
         self.action_lock = threading.Lock()
@@ -250,6 +270,11 @@ class RobotController:
         self.lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_sub.Init(self._on_state, 10)
 
+        self.left_hand_sub = ChannelSubscriber(TOPIC_LEFT_HAND_STATE, HandState_)
+        self.left_hand_sub.Init(self._on_left_hand, 10)
+        self.right_hand_sub = ChannelSubscriber(TOPIC_RIGHT_HAND_STATE, HandState_)
+        self.right_hand_sub.Init(self._on_right_hand, 10)
+
     def wait_for_state(self, timeout=5.0):
         t0 = time.time()
         while not self.state_received and time.time() - t0 < timeout:
@@ -266,6 +291,18 @@ class RobotController:
         self.imu_rpy = list(msg.imu_state.rpy)
         if not self.state_received:
             self.state_received = True
+
+    def _on_left_hand(self, msg: HandState_):
+        self.left_hand_state = msg
+        with self.hand_lock:
+            for i, ps in enumerate(msg.press_sensor_state[:N_HAND_SENSORS]):
+                self.left_pressures[i] = list(ps.pressure[:N_PRESS_PER_SENSOR])
+
+    def _on_right_hand(self, msg: HandState_):
+        self.right_hand_state = msg
+        with self.hand_lock:
+            for i, ps in enumerate(msg.press_sensor_state[:N_HAND_SENSORS]):
+                self.right_pressures[i] = list(ps.pressure[:N_PRESS_PER_SENSOR])
 
     def start_action(self, action_name):
         if self.e_stop:
@@ -421,7 +458,7 @@ class Dashboard:
         self.root = tk.Tk()
         self.root.title("Unitree G1 — Arm Control Dashboard")
         self.root.configure(bg="#1e1e1e")
-        self.root.geometry("1100x720")
+        self.root.geometry("1280x800")
         self.root.resizable(True, True)
 
         style = ttk.Style()
@@ -475,6 +512,18 @@ class Dashboard:
 
         self.mode_label = ttk.Label(left, text="mode_machine: --", style="TLabel")
         self.mode_label.pack(fill=tk.X, padx=4, pady=(4, 0))
+
+        # ---- Tactile sensor panel (below status, in left column) ----
+        ttk.Label(left, text="Tactile Sensors", style="Title.TLabel").pack(pady=(12, 4))
+        self.tactile_canvas = tk.Canvas(
+            left, width=300, height=230, bg="#1e1e1e",
+            highlightthickness=1, highlightbackground="#555",
+        )
+        self.tactile_canvas.pack(fill=tk.X, padx=0)
+        self._tactile_placeholder = self.tactile_canvas.create_text(
+            150, 110, text="Waiting for hand data...",
+            fill="#555", font=("Monospace", 9), justify=tk.CENTER,
+        )
 
         # ---- Center: Joint bars ----
         center = ttk.Frame(main)
@@ -608,6 +657,135 @@ class Dashboard:
                 fill="#555", font=("Monospace", 9), justify=tk.CENTER
             )
 
+    @staticmethod
+    def _pressure_normalized(vals):
+        """Compute mean pressure of active pads (above baseline threshold)."""
+        active = [v for v in vals if v > PRESS_BASELINE + 500]
+        if not active:
+            return 0.0
+        mean_above = sum(v - PRESS_BASELINE for v in active) / len(active)
+        return mean_above / (PRESS_MAX - PRESS_BASELINE)
+
+    @staticmethod
+    def _pressure_bar_color(t):
+        """Map normalized 0..1 to color: dark→cyan→green→yellow→red."""
+        t = max(0.0, min(t, 1.0))
+        if t < 0.01:
+            return "#333333"
+        if t < 0.33:
+            s = t / 0.33
+            r, g, b = 0, int(120 + 135 * s), int(200 * (1 - s * 0.5))
+        elif t < 0.66:
+            s = (t - 0.33) / 0.33
+            r, g, b = int(255 * s), 255, 0
+        else:
+            s = (t - 0.66) / 0.34
+            r, g, b = 255, int(255 * (1 - s)), 0
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _update_tactile(self):
+        """Draw per-sensor aggregated pressure bars for both hands."""
+        c = self.tactile_canvas
+        has_left = self.ctrl.left_hand_state is not None
+        has_right = self.ctrl.right_hand_state is not None
+
+        if not has_left and not has_right:
+            return
+
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 10 or ch < 10:
+            return
+
+        with self.ctrl.hand_lock:
+            lp = [row[:] for row in self.ctrl.left_pressures]
+            rp = [row[:] for row in self.ctrl.right_pressures]
+
+        hands = []
+        if has_left:
+            hands.append(("LEFT", lp))
+        if has_right:
+            hands.append(("RIGHT", rp))
+
+        n_hands = len(hands)
+        section_h = (ch - 6) // max(n_hands, 1)
+        label_w = 28
+        value_w = 50
+        bar_max_w = cw - label_w - value_w - 16
+
+        for hi, (hand_name, pressures) in enumerate(hands):
+            base_y = 3 + hi * section_h
+
+            c.create_text(
+                4, base_y, text=hand_name, anchor=tk.NW,
+                fill="#b0b0b0", font=("Monospace", 8, "bold"),
+            )
+
+            active_sensors = []
+            for si in range(min(N_HAND_SENSORS, len(pressures))):
+                vals = pressures[si]
+                is_connected = any(v > 1.0 for v in vals)
+                if not is_connected:
+                    continue
+                norm = self._pressure_normalized(vals)
+                n_active = sum(1 for v in vals if v > PRESS_BASELINE + 500)
+                peak = max(vals)
+                active_sensors.append((si, norm, n_active, peak))
+
+            if not active_sensors:
+                c.create_text(
+                    cw // 2, base_y + section_h // 2,
+                    text="(no active sensors)", fill="#555",
+                    font=("Monospace", 8),
+                )
+                continue
+
+            n_rows = len(active_sensors)
+            bar_h = max(8, min(18, (section_h - 18) // n_rows - 2))
+            y = base_y + 14
+
+            for si, norm, n_active, peak in active_sensors:
+                label = f"S{si}"
+                c.create_text(
+                    label_w - 2, y + bar_h // 2,
+                    text=label, anchor=tk.E,
+                    fill="#888", font=("Monospace", 7),
+                )
+
+                c.create_rectangle(
+                    label_w, y, label_w + bar_max_w, y + bar_h,
+                    fill="#252525", outline="#3a3a3a",
+                )
+
+                fill_w = int(norm * bar_max_w)
+                if fill_w > 1:
+                    color = self._pressure_bar_color(norm)
+                    c.create_rectangle(
+                        label_w, y,
+                        label_w + fill_w, y + bar_h,
+                        fill=color, outline="",
+                    )
+
+                    for pi in range(n_active):
+                        dot_x = label_w + fill_w - 3 - pi * 5
+                        if dot_x < label_w + 2:
+                            break
+                        c.create_oval(
+                            dot_x, y + 2, dot_x + 3, y + bar_h - 2,
+                            fill="#ffffff", outline="",
+                        )
+
+                delta_k = (peak - PRESS_BASELINE) / 1000.0
+                pct = int(norm * 100)
+                c.create_text(
+                    label_w + bar_max_w + 4, y + bar_h // 2,
+                    text=f"{pct}% ({n_active})",
+                    anchor=tk.W, fill="#aaa", font=("Monospace", 7),
+                )
+
+                y += bar_h + 2
+
     def _update_loop(self):
         if not self.ctrl.state_received:
             self.status_label.configure(text="Waiting for robot...")
@@ -632,6 +810,9 @@ class Dashboard:
 
             # Joint bars
             self._update_joint_bars()
+
+        # Tactile sensors
+        self._update_tactile()
 
         # Camera
         self._update_camera()

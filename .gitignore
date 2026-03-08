@@ -1,5 +1,4 @@
-# LeRobot (separate repo, cloned here)
-lerobot/
+# External repos are tracked as git submodules (see .gitmodules)
 
 # Recorded trajectories (can be large)
 trajectories/*.json
