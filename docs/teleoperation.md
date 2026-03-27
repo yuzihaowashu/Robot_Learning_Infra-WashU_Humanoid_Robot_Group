@@ -107,9 +107,9 @@ only the upper-body portion and forwards it to the robot.  This gives us:
 │                                                                     │
 │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐   │
 │  │ Redis Reader  │─▶│ Joint Safety │─▶│ Robot Sender (DDS)      │   │
-│  │               │  │  - URDF limit│  │  - rt/arm_sdk (17 DoF) │   │
-│  │ extract upper │  │  - delta clamp│  │  - rt/dex3/*/cmd (14D) │   │
-│  │ body [18:35]  │  │  - limit check│ └─────────────────────────┘   │
+│  │               │  │  - URDF limit│  │  - rt/arm_sdk (14 DoF) │   │
+│  │ extract arms  │  │  - delta clamp│  │  - rt/dex3/*/cmd (14D) │   │
+│  │ [21:35]       │  │  - limit check│ └─────────────────────────┘   │
 │  └──────────────┘  └──────────────┘                                 │
 │                           │                                          │
 │                           ▼                                          │
@@ -205,6 +205,7 @@ policy.
 | `action_hand_left_unitree_g1_with_hands` | JSON array | (7,) | TWIST2 teleop | `teleop_bridge.py` |
 | `action_hand_right_unitree_g1_with_hands` | JSON array | (7,) | TWIST2 teleop | `teleop_bridge.py` |
 | `t_action` | integer | — | TWIST2 teleop | `teleop_bridge.py` (staleness check) |
+| `action_neck_unitree_g1_with_hands` | JSON array | (2,) | TWIST2 teleop | **ignored** — no neck servo on our G1 |
 
 ---
 
@@ -241,7 +242,7 @@ mimic_obs (35 dimensions):
 ├─ [5:6]   yaw angular velocity               ← ignored
 ├─ [6:12]  left leg joint angles (6 DoF)      ← ignored
 ├─ [12:18] right leg joint angles (6 DoF)     ← ignored
-├─ [18:21] waist joint angles (3 DoF)         ← USED → Unitree joints [12,13,14]
+├─ [18:21] waist joint angles (3 DoF)         ← ignored by default (opt-in with --with-waist)
 ├─ [21:28] left arm joint angles (7 DoF)      ← USED → Unitree joints [15:22]
 └─ [28:35] right arm joint angles (7 DoF)     ← USED → Unitree joints [22:29]
 ```
@@ -249,16 +250,18 @@ mimic_obs (35 dimensions):
 Hand data is separate: 7 motors per hand, interpolated between open/close
 poses based on trigger/grip button state.
 
-### Step 4: Bridge extracts upper body
+**Neck data** is also separate: TWIST2 publishes a 2D vector (yaw, pitch)
+to Redis key `action_neck_unitree_g1_with_hands` for driving an external
+neck servo that pans/tilts a camera.  **We ignore this entirely** because
+our G1 uses the fixed built-in camera — no neck servo is installed.
 
-`teleop_bridge.py` reads Redis at 50 Hz and extracts only the upper-body
-slice: `mimic_obs[18:35]` → 17 joint angles mapping to:
+### Step 4: Bridge extracts arms
+
+`teleop_bridge.py` reads Redis at 50 Hz and by default extracts only the
+**arm joints**: `mimic_obs[21:35]` → 14 joint angles (arms only, no waist):
 
 | mimic_obs index | Unitree joint index | Joint name |
 |-----------------|---------------------|------------|
-| 18 | 12 | waist_yaw |
-| 19 | 13 | waist_roll |
-| 20 | 14 | waist_pitch |
 | 21 | 15 | left_shoulder_pitch |
 | 22 | 16 | left_shoulder_roll |
 | 23 | 17 | left_shoulder_yaw |
@@ -273,6 +276,19 @@ slice: `mimic_obs[18:35]` → 17 joint angles mapping to:
 | 32 | 26 | right_wrist_roll |
 | 33 | 27 | right_wrist_pitch |
 | 34 | 28 | right_wrist_yaw |
+
+With `--with-waist`, the waist joints are also included (17 DoF total):
+
+| mimic_obs index | Unitree joint index | Joint name |
+|-----------------|---------------------|------------|
+| 18 | 12 | waist_yaw |
+| 19 | 13 | waist_roll |
+| 20 | 14 | waist_pitch |
+
+**Why arms-only by default**: For tabletop manipulation, the waist rarely
+needs to move, and unintended waist rotation from noisy VR tracking can
+destabilize the robot or cause collisions with the table.  The waist is
+locked at its neutral position (0,0,0) via `rt/arm_sdk` PD control.
 
 ### Step 4b: Hand finger remapping
 
@@ -370,9 +386,13 @@ This prevents sudden jerks when stopping teleoperation.
 
 ### 5. Balance Preservation
 
-The bridge ONLY controls the upper body (joints 12-28 via `rt/arm_sdk`).
-Unitree's built-in locomotion controller maintains leg/body balance
-throughout.  The robot remains push-resistant during teleoperation.
+By default the bridge only controls the two arms (joints 15-28, 14 DoF)
+via `rt/arm_sdk`.  The waist is locked at neutral (0,0,0) and the legs
+are managed entirely by Unitree's built-in locomotion controller.  The
+robot remains push-resistant during teleoperation.
+
+With `--with-waist`, waist joints (12-14) are also controlled from VR,
+giving 17 DoF total.  Use this only if your task requires torso rotation.
 
 ### 6. What We Do NOT Have (future work)
 

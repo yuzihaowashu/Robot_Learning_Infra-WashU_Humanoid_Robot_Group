@@ -22,6 +22,7 @@ from teleop_bridge import (
     ARM_JOINT_NAMES,
     ARM_JOINTS,
     ARM_SDK_JOINTS,
+    ARMS_ONLY_JOINTS,
     CONTROL_HZ,
     HAND_JOINT_NAMES,
     HAND_REMAP_LEFT,
@@ -50,25 +51,44 @@ from teleop_bridge import (
 
 
 class TestMimicObsExtraction(unittest.TestCase):
-    """Test extraction of upper-body joints from TWIST2's 35D mimic_obs."""
+    """Test extraction of arm joints from TWIST2's 35D mimic_obs."""
 
-    def test_correct_dimensions(self):
+    def test_default_arms_only_14dof(self):
+        """Default mode returns 14 arm joints (no waist)."""
         obs = np.zeros(MIMIC_OBS_DIM)
         result = extract_upper_body_from_mimic_obs(obs)
+        self.assertEqual(len(result), len(ARMS_ONLY_JOINTS))
+        for j in ARMS_ONLY_JOINTS:
+            self.assertIn(j, result)
+        for j in WAIST_JOINTS:
+            self.assertNotIn(j, result)
+
+    def test_with_waist_17dof(self):
+        """With include_waist=True, returns 17 joints."""
+        obs = np.zeros(MIMIC_OBS_DIM)
+        result = extract_upper_body_from_mimic_obs(obs, include_waist=True)
         self.assertEqual(len(result), len(ARM_SDK_JOINTS))
         for j in ARM_SDK_JOINTS:
             self.assertIn(j, result)
 
-    def test_waist_mapping(self):
-        """Waist joints (indices 12-14) should come from mimic_obs[18:21]."""
+    def test_waist_mapping_when_enabled(self):
+        """Waist joints (indices 12-14) come from mimic_obs[18:21] when enabled."""
         obs = np.zeros(MIMIC_OBS_DIM)
         obs[18] = 0.1   # waist_yaw
         obs[19] = 0.2   # waist_roll
         obs[20] = 0.3   # waist_pitch
-        result = extract_upper_body_from_mimic_obs(obs)
+        result = extract_upper_body_from_mimic_obs(obs, include_waist=True)
         self.assertAlmostEqual(result[12], 0.1)
         self.assertAlmostEqual(result[13], 0.2)
         self.assertAlmostEqual(result[14], 0.3)
+
+    def test_waist_ignored_by_default(self):
+        """Waist data in mimic_obs should NOT appear when include_waist=False."""
+        obs = np.zeros(MIMIC_OBS_DIM)
+        obs[18:21] = [0.5, 0.3, -0.1]
+        result = extract_upper_body_from_mimic_obs(obs)
+        for j in WAIST_JOINTS:
+            self.assertNotIn(j, result)
 
     def test_left_arm_mapping(self):
         """Left arm joints (15-21) should come from mimic_obs[21:28]."""
@@ -91,12 +111,11 @@ class TestMimicObsExtraction(unittest.TestCase):
     def test_lower_body_ignored(self):
         """Lower body fields (obs[0:18]) should NOT appear in output."""
         obs = np.ones(MIMIC_OBS_DIM) * 999.0
-        obs[MIMIC_WAIST_SLICE] = 0.0
         obs[MIMIC_LEFT_ARM_SLICE] = 0.0
         obs[MIMIC_RIGHT_ARM_SLICE] = 0.0
 
         result = extract_upper_body_from_mimic_obs(obs)
-        for j in ARM_SDK_JOINTS:
+        for j in ARMS_ONLY_JOINTS:
             self.assertAlmostEqual(result[j], 0.0,
                                    msg=f"Joint {j} should be 0, not contaminated by lower body")
 
@@ -106,27 +125,40 @@ class TestMimicObsExtraction(unittest.TestCase):
         with self.assertRaises(AssertionError):
             extract_upper_body_from_mimic_obs(np.zeros(40))
 
-    def test_realistic_mimic_obs(self):
-        """Simulate a plausible TWIST2 mimic_obs vector."""
+    def test_realistic_mimic_obs_arms_only(self):
+        """Simulate a plausible TWIST2 mimic_obs — arms only (default)."""
         obs = np.zeros(MIMIC_OBS_DIM)
-        obs[0:2] = [0.1, -0.05]      # base vel xy
-        obs[2] = 0.74                 # standing height
-        obs[3:5] = [0.01, -0.02]     # roll, pitch
-        obs[5] = 0.0                  # yaw vel
-        obs[6:12] = [0.0, 0.0, -0.4, 0.8, -0.4, 0.0]   # left leg
-        obs[12:18] = [0.0, 0.0, -0.4, 0.8, -0.4, 0.0]  # right leg
-        obs[18:21] = [0.05, 0.0, -0.1]                   # waist
-        obs[21:28] = [-0.5, 0.3, 0.0, 0.8, 0.0, 0.0, 0.0]  # left arm
-        obs[28:35] = [-0.5, -0.3, 0.0, 0.8, 0.0, 0.0, 0.0] # right arm
+        obs[0:2] = [0.1, -0.05]
+        obs[2] = 0.74
+        obs[3:5] = [0.01, -0.02]
+        obs[5] = 0.0
+        obs[6:12] = [0.0, 0.0, -0.4, 0.8, -0.4, 0.0]
+        obs[12:18] = [0.0, 0.0, -0.4, 0.8, -0.4, 0.0]
+        obs[18:21] = [0.05, 0.0, -0.1]
+        obs[21:28] = [-0.5, 0.3, 0.0, 0.8, 0.0, 0.0, 0.0]
+        obs[28:35] = [-0.5, -0.3, 0.0, 0.8, 0.0, 0.0, 0.0]
 
         result = extract_upper_body_from_mimic_obs(obs)
 
-        self.assertAlmostEqual(result[12], 0.05)   # waist_yaw
-        self.assertAlmostEqual(result[15], -0.5)    # left shoulder pitch
-        self.assertAlmostEqual(result[16], 0.3)     # left shoulder roll
-        self.assertAlmostEqual(result[18], 0.8)     # left elbow
-        self.assertAlmostEqual(result[22], -0.5)    # right shoulder pitch
-        self.assertAlmostEqual(result[23], -0.3)    # right shoulder roll
+        self.assertNotIn(12, result)
+        self.assertAlmostEqual(result[15], -0.5)
+        self.assertAlmostEqual(result[16], 0.3)
+        self.assertAlmostEqual(result[18], 0.8)
+        self.assertAlmostEqual(result[22], -0.5)
+        self.assertAlmostEqual(result[23], -0.3)
+
+    def test_realistic_mimic_obs_with_waist(self):
+        """Same data but with waist included."""
+        obs = np.zeros(MIMIC_OBS_DIM)
+        obs[18:21] = [0.05, 0.0, -0.1]
+        obs[21:28] = [-0.5, 0.3, 0.0, 0.8, 0.0, 0.0, 0.0]
+        obs[28:35] = [-0.5, -0.3, 0.0, 0.8, 0.0, 0.0, 0.0]
+
+        result = extract_upper_body_from_mimic_obs(obs, include_waist=True)
+
+        self.assertAlmostEqual(result[12], 0.05)
+        self.assertAlmostEqual(result[15], -0.5)
+        self.assertAlmostEqual(result[22], -0.5)
 
 
 class TestJointClamping(unittest.TestCase):
@@ -205,13 +237,23 @@ class TestHandClamping(unittest.TestCase):
 class TestMockRedisReader(unittest.TestCase):
     """Test mock reader generates valid frames."""
 
-    def test_wave_motion_valid(self):
+    def test_wave_arms_only(self):
+        """Default: arms only (14 joints, no waist)."""
         reader = MockRedisReader(motion="wave")
         frame = reader.read()
         self.assertTrue(frame.valid)
-        self.assertEqual(len(frame.upper_body), len(ARM_SDK_JOINTS))
+        self.assertEqual(len(frame.upper_body), len(ARMS_ONLY_JOINTS))
+        for j in WAIST_JOINTS:
+            self.assertNotIn(j, frame.upper_body)
         self.assertEqual(len(frame.left_hand), N_HAND_MOTORS)
         self.assertEqual(len(frame.right_hand), N_HAND_MOTORS)
+
+    def test_wave_with_waist(self):
+        """With include_waist: 17 joints."""
+        reader = MockRedisReader(motion="wave", include_waist=True)
+        frame = reader.read()
+        self.assertTrue(frame.valid)
+        self.assertEqual(len(frame.upper_body), len(ARM_SDK_JOINTS))
 
     def test_reach_motion_valid(self):
         reader = MockRedisReader(motion="reach")
@@ -253,18 +295,31 @@ class TestMockRobotSender(unittest.TestCase):
         sender = MockRobotSender()
         self.assertTrue(sender.wait_for_state())
 
+    def test_arms_only_default(self):
+        """Default sender tracks only arm joints (no waist)."""
+        sender = MockRobotSender()
+        current = sender.get_current_positions()
+        self.assertEqual(len(current), len(ARMS_ONLY_JOINTS))
+        for j in WAIST_JOINTS:
+            self.assertNotIn(j, current)
+
+    def test_with_waist(self):
+        sender = MockRobotSender(include_waist=True)
+        current = sender.get_current_positions()
+        self.assertEqual(len(current), len(ARM_SDK_JOINTS))
+
     def test_send_arm_updates_positions(self):
         sender = MockRobotSender()
-        positions = {j: 0.5 for j in ARM_SDK_JOINTS}
+        positions = {j: 0.5 for j in ARMS_ONLY_JOINTS}
         sender.send_arm(positions)
         current = sender.get_current_positions()
-        for j in ARM_SDK_JOINTS:
+        for j in ARMS_ONLY_JOINTS:
             self.assertAlmostEqual(current[j], 0.5)
 
     def test_initial_positions_zero(self):
         sender = MockRobotSender()
         current = sender.get_current_positions()
-        for j in ARM_SDK_JOINTS:
+        for j in ARMS_ONLY_JOINTS:
             self.assertAlmostEqual(current[j], 0.0)
 
 
@@ -480,13 +535,13 @@ class TestTeleopBridgeIntegration(unittest.TestCase):
     def test_delta_clamping_effective_in_loop(self):
         """Verify that rapid target changes are smoothed by delta clamping."""
         reader = MockRedisReader(motion="wave")
-        last_pos = {j: 0.0 for j in ARM_SDK_JOINTS}
+        last_pos = {j: 0.0 for j in ARMS_ONLY_JOINTS}
 
         max_observed_delta = 0.0
         for _ in range(100):
             frame = reader.read()
             positions = clamp_joints(frame.upper_body, last_pos)
-            for j in ARM_SDK_JOINTS:
+            for j in ARMS_ONLY_JOINTS:
                 delta = abs(positions[j] - last_pos[j])
                 max_observed_delta = max(max_observed_delta, delta)
             last_pos = positions
@@ -521,7 +576,7 @@ class TestRedisDataSimulation(unittest.TestCase):
     def test_standing_pose(self):
         obs = self._make_twist2_mimic_obs()
         result = extract_upper_body_from_mimic_obs(obs)
-        for j in ARM_SDK_JOINTS:
+        for j in ARMS_ONLY_JOINTS:
             self.assertAlmostEqual(result[j], 0.0)
 
     def test_arms_raised(self):
@@ -533,9 +588,15 @@ class TestRedisDataSimulation(unittest.TestCase):
         self.assertAlmostEqual(result[15], -1.5)
         self.assertAlmostEqual(result[22], -1.5)
 
-    def test_waist_turned(self):
+    def test_waist_ignored_by_default(self):
         obs = self._make_twist2_mimic_obs(waist=(0.5, 0.1, -0.1))
         result = extract_upper_body_from_mimic_obs(obs)
+        for j in WAIST_JOINTS:
+            self.assertNotIn(j, result)
+
+    def test_waist_turned_when_enabled(self):
+        obs = self._make_twist2_mimic_obs(waist=(0.5, 0.1, -0.1))
+        result = extract_upper_body_from_mimic_obs(obs, include_waist=True)
         self.assertAlmostEqual(result[12], 0.5)
         self.assertAlmostEqual(result[13], 0.1)
         self.assertAlmostEqual(result[14], -0.1)
@@ -622,6 +683,10 @@ class TestJointMappingConsistency(unittest.TestCase):
 
     def test_total_upper_body_17dof(self):
         self.assertEqual(len(ARM_SDK_JOINTS), 17)
+
+    def test_arms_only_14dof(self):
+        self.assertEqual(len(ARMS_ONLY_JOINTS), 14)
+        self.assertEqual(ARMS_ONLY_JOINTS, LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS)
 
     def test_hand_14dof(self):
         self.assertEqual(len(HAND_JOINT_NAMES), N_HAND_MOTORS * 2)
