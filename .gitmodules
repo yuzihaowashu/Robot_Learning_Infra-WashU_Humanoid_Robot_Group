@@ -4,3 +4,6 @@
 [submodule "Isaac-GR00T"]
 	path = Isaac-GR00T
 	url = https://github.com/NVIDIA/Isaac-GR00T.git
+[submodule "TWIST2"]
+	path = TWIST2
+	url = git@github.com:amazon-far/TWIST2.git

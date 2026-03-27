@@ -10,6 +10,7 @@ and run Vision-Language-Action (VLA) inference via NVIDIA GR00T N1.6.
 | **VLA Inference** — GR00T N1.6 zero-shot control | `bash run_vla.sh` | [docs/vla_inference.md](docs/vla_inference.md) |
 | **Data Collection** — Record LeRobot datasets from demos | `bash run_collect.sh` | [docs/data_collection.md](docs/data_collection.md) |
 | **Drag-and-Teach** — Record & replay arm trajectories | `bash run_teach.sh` | [docs/teach_and_replay.md](docs/teach_and_replay.md) |
+| **VR Teleoperation** — PICO 4 Ultra VR → upper body control | `bash run_teleop.sh` | [docs/teleoperation.md](docs/teleoperation.md) |
 | **Dashboard** — Real-time GUI with camera, joints, tactile | `bash run_dashboard.sh` | [docs/dashboard.md](docs/dashboard.md) |
 | **Tactile Sensors** — Dex3 pressure sensor visualization | Integrated in dashboard | [docs/tactile_sensors.md](docs/tactile_sensors.md) |
 | **Setup & Arm Control** — Low-level SDK, joint maps, limits | — | [docs/setup_and_arm_control.md](docs/setup_and_arm_control.md) |
@@ -52,7 +53,30 @@ python -m lerobot.scripts.lerobot_dataset_viz \
 See [Teach & Replay docs](docs/teach_and_replay.md) and
 [Data Collection docs](docs/data_collection.md).
 
-### 3. Dashboard
+### 3. VR Teleoperation (PICO 4 Ultra)
+
+Record demonstrations by teleoperating the robot's upper body with a VR
+headset.  Uses [TWIST2](https://github.com/amazon-far/TWIST2) for PICO VR
+reading and motion retargeting, connected to our control pipeline via Redis.
+
+```bash
+# Quick test without any hardware
+bash run_teleop.sh mock record
+
+# Live teleoperation (requires PICO + Redis + robot)
+# Terminal 1: Start PICO PC Service app
+# Terminal 2: Start TWIST2 teleop
+conda activate gmr && cd TWIST2 && bash teleop.sh
+# Terminal 3: Start bridge + record
+bash run_teleop.sh record
+```
+
+Recorded trajectories are in the same JSON format as drag-and-teach, so
+the downstream `collect_dataset.py` → LeRobot → GR00T pipeline works with
+zero changes.  See [Teleoperation docs](docs/teleoperation.md) for full
+setup and design details.
+
+### 4. Dashboard
 
 ```bash
 # Launch with auto camera setup
@@ -79,34 +103,41 @@ After usage:
 ## Project Structure
 
 ```
-chongjie.zhang/
+.
 ├── run_vla.sh                    # VLA inference (server + client)
 ├── run_collect.sh                # Data collection (replay → LeRobot)
 ├── run_teach.sh                  # Drag-and-teach (record + replay)
+├── run_teleop.sh                 # VR teleoperation bridge
 ├── run_dashboard.sh              # GUI dashboard + camera
 ├── trajectories/                 # Saved trajectory JSON files
+├── datasets/                     # LeRobot v2 datasets
 ├── Isaac-GR00T/                  # [submodule] NVIDIA GR00T N1.6
 ├── lerobot/                      # [submodule] HuggingFace LeRobot
+├── TWIST2/                       # [submodule] PICO VR teleop + GMR
 ├── docs/
 │   ├── vla_inference.md          # VLA pipeline details
 │   ├── data_collection.md        # Dataset collection from demos
 │   ├── teach_and_replay.md       # Drag-and-teach details
+│   ├── teleoperation.md          # VR teleoperation design & setup
 │   ├── dashboard.md              # Dashboard GUI details
 │   ├── tactile_sensors.md        # Dex3 tactile sensor details
 │   └── setup_and_arm_control.md  # Low-level SDK and joint reference
-└── utils/
-    ├── vla_client.py             # GR00T ↔ G1 bridge (DDS + ZMQ)
-    ├── collect_dataset.py        # LeRobot dataset collection
-    ├── dashboard.py              # Tkinter GUI (joints, camera, tactile)
-    ├── teach.py                  # Drag-and-teach recorder
-    ├── replay.py                 # Trajectory replay with gravity comp.
-    ├── robot_camera_server.py    # Camera server (deployed to robot)
-    ├── test_tactile.py           # Raw tactile sensor debugging
-    ├── arm_demo.py               # Choreographed arm motion sequences
-    ├── visualize_workspace.py    # Arm workspace envelope (URDF)
-    ├── test_arm_control.py       # Basic arm control test
-    ├── start_camera.sh           # Manual camera start
-    └── stop_camera.sh            # Manual camera stop
+├── utils/
+│   ├── vla_client.py             # GR00T ↔ G1 bridge (DDS + ZMQ)
+│   ├── collect_dataset.py        # LeRobot dataset collection
+│   ├── teleop_bridge.py          # TWIST2 Redis → G1 DDS bridge
+│   ├── dashboard.py              # Tkinter GUI (joints, camera, tactile)
+│   ├── teach.py                  # Drag-and-teach recorder
+│   ├── replay.py                 # Trajectory replay with gravity comp.
+│   ├── robot_camera_server.py    # Camera server (deployed to robot)
+│   ├── test_tactile.py           # Raw tactile sensor debugging
+│   ├── arm_demo.py               # Choreographed arm motion sequences
+│   ├── visualize_workspace.py    # Arm workspace envelope (URDF)
+│   ├── test_arm_control.py       # Basic arm control test
+│   ├── start_camera.sh           # Manual camera start
+│   └── stop_camera.sh            # Manual camera stop
+└── tests/
+    └── test_teleop_bridge.py     # Teleop bridge unit tests (49 tests)
 ```
 
 ## Architecture
@@ -122,28 +153,71 @@ chongjie.zhang/
   └─────────────┘       │  └─────┬─────┘   └─────┬─────┘ │
                         │        │                │       │
                         │   DDS  │           DDS  │       │
-                        └────────┼────────────────┼───────┘
-                                 │                │
-                        ┌────────▼────────────────▼───────┐
-                        │         Unitree G1 Robot        │
-                        │  rt/arm_sdk ← arm commands      │
+  ┌─────────────┐       │        │                │       │
+  │ PICO 4 Ultra│       │  ┌─────┴─────────────┐  │       │
+  │ VR Headset  │       │  │  teleop_bridge.py  ◄─Redis   │
+  │ + TWIST2    │──Redis──►│  (VR → upper body) │  │       │
+  │ (gmr env)   │       │  └─────┬──────────────┘  │       │
+  └─────────────┘       │        │                 │       │
+                        │   DDS  │                 │       │
+                        └────────┼─────────────────┼───────┘
+                                 │                 │
+                        ┌────────▼─────────────────▼───────┐
+                        │         Unitree G1 Robot         │
+                        │  rt/arm_sdk ← arm commands       │
                         │  rt/lowstate → joint feedback    │
-                        │  rt/dex3/*/cmd ← hand commands  │
-                        │  rt/dex3/*/state → tactile data │
-                        │  ZMQ:5555 → camera stream       │
-                        └─────────────────────────────────┘
+                        │  rt/dex3/*/cmd ← hand commands   │
+                        │  rt/dex3/*/state → tactile data  │
+                        │  ZMQ:5555 → camera stream        │
+                        └──────────────────────────────────┘
+```
+
+## Data Collection Workflows
+
+Two paths to create training datasets, both producing the same LeRobot v2
+format:
+
+```
+Path A: Drag-and-Teach                 Path B: VR Teleoperation
+┌─────────────────────┐                ┌─────────────────────┐
+│ Physically move arms │                │ Move VR controllers  │
+│ teach.py → JSON      │                │ TWIST2 → Redis →     │
+│                      │                │ teleop_bridge.py →   │
+│                      │                │ JSON                 │
+└──────────┬──────────┘                └──────────┬──────────┘
+           │                                      │
+           │    same JSON format                   │
+           ▼                                      ▼
+    ┌──────────────────────────────────────────────────┐
+    │ collect_dataset.py                               │
+    │ replay trajectory + record camera → LeRobot v2   │
+    └──────────────────────┬───────────────────────────┘
+                           │
+                           ▼
+                 ┌──────────────────┐
+                 │ LeRobot v2 Dataset│
+                 │ (Parquet + MP4)  │
+                 └────────┬─────────┘
+                          │
+                          ▼
+                 ┌──────────────────┐
+                 │ GR00T Training /  │
+                 │ VLA Fine-tuning   │
+                 └──────────────────┘
 ```
 
 ## Environment
 
 | Component | Version / Path |
 |-----------|---------------|
-| Conda env | `lerobot` (Python 3.12) |
+| Conda env (main) | `lerobot` (Python 3.12) |
+| Conda env (TWIST2) | `gmr` (Python 3.10) |
 | GR00T venv | `Isaac-GR00T/.venv` (Python 3.10, uv) |
 | Unitree SDK2 | `/home/humanoid-pc/unitree_sdk2_python` |
 | URDF | `/home/humanoid-pc/unitree_rl_gym/resources/robots/g1_description/` |
 | GPU | NVIDIA RTX 4080 (16GB), CUDA 12.6, flash-attn 2.7.4 |
 | Robot SSH | `unitree@192.168.123.164` |
+| Redis | localhost:6379 (for VR teleoperation) |
 
 ## Cloning This Repo
 
@@ -153,4 +227,16 @@ cd WashU_Humanoid_Robot_Group_Infrastructure
 
 # If already cloned without submodules:
 git submodule update --init
+```
+
+This pulls three submodules:
+- `Isaac-GR00T/` — NVIDIA GR00T N1.6
+- `lerobot/` — HuggingFace LeRobot
+- `TWIST2/` — PICO VR teleoperation + GMR retargeting
+
+## Running Tests
+
+```bash
+# Teleop bridge tests (no hardware needed)
+python -m pytest tests/test_teleop_bridge.py -v
 ```

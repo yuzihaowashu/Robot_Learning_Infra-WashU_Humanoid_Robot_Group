@@ -61,17 +61,37 @@ lerobot-info  # Should show LeRobot 0.4.5, PyTorch with CUDA, RTX 4080
 
 ### Two Control Approaches
 
-#### Approach A: `rt/arm_sdk` (High-Level Arm Overlay)
+#### Approach A: `rt/arm_sdk` (High-Level Arm Overlay) ✅ Used by this repo
 - Publishes arm commands on top of the active locomotion controller
 - **Requires**: Locomotion controller running (`SelectMode("ai")` + robot standing)
-- **Suitable for**: Robot standing on the ground
+- **Suitable for**: Robot standing on the ground, tabletop manipulation
 - **Does NOT work when**: Robot is hanging or locomotion controller is inactive
+- **Used by**: `teach.py`, `collect_dataset.py`, `vla_client.py`, `teleop_bridge.py`
 
-#### Approach B: `rt/lowcmd` (Direct Motor Control) ✅ Currently Used
+#### Approach B: `rt/lowcmd` (Direct Motor Control)
 - Sends PD commands directly to motor controllers
 - **Requires**: `ReleaseMode()` first (no other controller should be writing to rt/lowcmd)
 - **Suitable for**: Robot hanging on test stand, or full-body control
 - **Caution**: You are responsible for all joints; no balance controller running
+- **Used by**: TWIST2's RL policy (`server_low_level_g1_real.py`), GR00T WholeBodyControl
+
+#### Comparison Table
+
+| Feature | `rt/arm_sdk` | `rt/lowcmd` |
+|---------|-------------|-------------|
+| Balance | Unitree locomotion controller handles it | You must provide balance (RL policy / gravity comp) |
+| Controlled joints | Upper body only (17 DoF) | All 29 DoF |
+| Prerequisite | Locomotion controller active + standing | `ReleaseMode()` — no other controller writing |
+| Safety | Locomotion rejects unsafe whole-body states | No guardrails — full responsibility on user |
+| Hanging test stand | **Does NOT work** | Works |
+| Tabletop manipulation | Recommended | Overkill for upper-body tasks |
+| Our repo scripts | `teach.py`, `vla_client.py`, `teleop_bridge.py` | — |
+| External projects | — | TWIST2 RL policy, GR00T WBC |
+
+> **Why we chose `rt/arm_sdk`**: For VR teleoperation of upper-body tasks,
+> we want the robot to stay balanced without needing a full-body RL policy.
+> `rt/arm_sdk` lets Unitree's locomotion controller manage the legs while
+> we overlay arm commands — safer and simpler for tabletop pick-and-place.
 
 ### Control Flow
 
@@ -220,8 +240,26 @@ unitree-sdk2py (installed in the venv for the client).
 
 ## Dex3 Hand Protocol
 
-Each hand has 7 motors. Commands sent via `rt/dex3/{left,right}/cmd`
-using `HandCmd_` messages.
+Each hand has 7 motors (3 thumb + 2 index + 2 middle). Commands sent via
+`rt/dex3/{left,right}/cmd` using `HandCmd_` messages.
+
+### Two Hand Control SDKs
+
+There are two SDKs for controlling Dex3-1 hands, with **different finger orderings**:
+
+| SDK | Used by | Communication | Left hand order | Right hand order |
+|-----|---------|---------------|-----------------|------------------|
+| `unitree_sdk2py` (DDS `HandCmd_`) | Our repo | DDS topics `rt/dex3/*/cmd` | Thumb, Index, Middle | Thumb, Index, Middle |
+| `unitree_interface` (C++ binding) | TWIST2 | Direct USB/serial | Thumb, **Middle**, **Index** | Thumb, Index, Middle |
+
+The left hand has **swapped Index and Middle** between the two SDKs.
+`teleop_bridge.py` applies `HAND_REMAP_LEFT = [0,1,2, 5,6, 3,4]` to
+convert TWIST2's ordering to DDS ordering before sending.
+
+> **Important**: This remapping is based on code analysis of TWIST2's
+> `dex_hand_wrapper.py`. Verify on the real robot that the correct
+> fingers move when you squeeze the VR trigger. If a finger is wrong,
+> adjust `HAND_REMAP_LEFT` / `HAND_REMAP_RIGHT` in `teleop_bridge.py`.
 
 ### RIS Mode Encoding
 ```python
