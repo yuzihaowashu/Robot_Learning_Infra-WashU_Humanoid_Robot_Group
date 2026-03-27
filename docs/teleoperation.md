@@ -16,6 +16,14 @@ changes.
   - [Hand Finger Remapping](#step-4b-hand-finger-remapping)
 - [Safety Measures](#safety-measures)
 - [Joint Ordering Verification](#joint-ordering-verification)
+- [PICO 4 Ultra VR Setup Guide](#pico-4-ultra-vr-setup-guide)
+  - [Network Topology](#network-topology)
+  - [PC Network Interfaces](#pc-network-interfaces)
+  - [PICO Headset Configuration](#pico-headset-configuration)
+  - [TWIST2 `teleop.sh` Parameters](#twist2-teleopsh-parameters)
+  - [Firewall](#firewall)
+  - [Startup Sequence](#startup-sequence-checklist)
+  - [VR Controller Button Map](#vr-controller-button-map)
 - [Prerequisites & Installation](#prerequisites--installation)
 - [Usage](#usage)
 - [Trajectory Format & Downstream Compatibility](#trajectory-format--downstream-compatibility)
@@ -411,6 +419,204 @@ right_arm = obs[28:35]   # should match motor_state[22:29].q
 
 If any joint is swapped or negated, update the mapping in
 `extract_upper_body_from_mimic_obs()` in `teleop_bridge.py`.
+
+---
+
+## PICO 4 Ultra VR Setup Guide
+
+This section covers every configuration needed to get the PICO 4 Ultra
+headset streaming body and hand tracking data to your PC.
+
+### Network Topology
+
+All three devices must be reachable on the same local network:
+
+```
+┌─────────────────┐        WiFi         ┌──────────────────────┐
+│ PICO 4 Ultra    │◄───────────────────►│ WiFi Router          │
+│ (VR headset)    │                      │                      │
+└─────────────────┘                      └──────────┬───────────┘
+                                                    │ WiFi or Ethernet
+                                           ┌────────▼───────────┐
+                                           │ Ubuntu PC           │
+                                           │  - XRoboToolkit     │    Ethernet
+                                           │    PC Service       │◄──────────► G1 Robot
+                                           │  - TWIST2 teleop    │  192.168.123.x
+                                           │  - teleop_bridge    │
+                                           │  - Redis            │
+                                           └─────────────────────┘
+```
+
+**Key constraint**: The PICO headset and your Ubuntu PC must be on the
+**same WiFi network**. Enterprise/campus WiFi with client isolation will
+NOT work — use a personal router or hotspot.
+
+### PC Network Interfaces
+
+Your PC needs **two network connections** simultaneously:
+
+| Interface | Connects to | PC IP | Remote IP | Subnet |
+|-----------|-------------|-------|-----------|--------|
+| **Ethernet** | G1 Robot | `192.168.123.222` | `192.168.123.164` | `255.255.255.0` |
+| **WiFi** | PICO (via router) | DHCP (e.g. `192.168.1.100`) | — | — |
+
+Set up the Ethernet interface:
+```bash
+# Configure the Ethernet adapter connecting to the robot
+# (replace enp3s0 with your actual interface name)
+sudo ip addr add 192.168.123.222/24 dev enp3s0
+sudo ip link set enp3s0 up
+
+# Verify connectivity
+ping 192.168.123.164
+```
+
+Note your WiFi IP — you will need it when connecting from the PICO:
+```bash
+# Find your WiFi IP
+hostname -I
+# or
+ip addr show wlan0 | grep "inet "
+```
+
+### PICO Headset Configuration
+
+#### 1. Install XRoboToolkit Client APK
+
+Download the APK from [XRoboToolkit-Unity-Client releases](https://github.com/XR-Robotics/XRoboToolkit-Unity-Client/releases/)
+and install it on the PICO via sideloading:
+
+```bash
+adb install XRoboToolkit-Unity-Client-vX.X.X.apk
+```
+
+#### 2. Configure `video_source.yml` (optional)
+
+This file on the PICO controls the RGB video stream displayed inside VR
+(e.g., from a ZED Mini camera mounted on the robot's head). If you don't
+need a first-person camera view inside VR, you can skip this.
+
+```bash
+# Pull the current config from PICO
+adb pull /sdcard/Android/data/com.xrobotoolkit.client/files/video_source.yml
+
+# Edit as needed (e.g., set the ZED camera stream URL)
+# Then push back
+adb push video_source.yml /sdcard/Android/data/com.xrobotoolkit.client/files/video_source.yml
+```
+
+#### 3. Connect to PC
+
+1. Put on the PICO headset
+2. Open the **XRobot** app
+3. Enter your PC's **WiFi IP address** (NOT the Ethernet IP `192.168.123.222`)
+4. Tap **Connect**
+5. Tap **Start streaming** for whole-body data and hand data
+
+### PC XRoboToolkit Service
+
+The XRoboToolkit PC Service is a background application that bridges PICO
+tracking data to Python via a local SDK. **It must be running before you
+start TWIST2 teleop.**
+
+```bash
+# Install (one-time)
+sudo dpkg -i XRoboToolkit_PC_Service_1.0.0_ubuntu_22.04_amd64.deb
+
+# Launch — find "xrobotoolkit-pc-service" in your Ubuntu app launcher
+# or run from terminal:
+xrobotoolkit-pc-service
+```
+
+Once running, the PC Service automatically discovers the PICO connection.
+TWIST2's `XRobotStreamer()` reads data from it with no IP/port arguments
+needed — the SDK handles discovery internally.
+
+### TWIST2 `teleop.sh` Parameters
+
+Edit `TWIST2/teleop.sh` before your first session:
+
+```bash
+# Redis IP — use "localhost" if Redis runs on this same PC
+# Use the robot's WiFi IP if Redis runs on the robot's onboard computer
+redis_ip="localhost"
+
+# Your height in meters — TWIST2 recommends setting this SLIGHTLY LOWER
+# than your actual height due to PICO body estimation inaccuracy.
+# Example: if you are 1.75m, try 1.65–1.70
+actual_human_height=1.6
+```
+
+Full parameter reference:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `redis_ip` | `"localhost"` | IP of the machine running Redis. Change if Redis is on another host. |
+| `actual_human_height` | `1.6` | Your height in meters (set ~5cm below actual). Affects arm reach scaling in GMR retargeting. |
+| `--target_fps` | `100` | Teleop loop target frame rate. Usually no need to change. |
+| `--measure_fps` | `1` | Print FPS stats every N seconds. |
+| `--smooth` | disabled | Uncomment to enable motion smoothing (reduces VR tracking jitter). |
+| `--pinch_mode` | disabled | Uncomment to use pinch-based hand control instead of trigger/grip. |
+
+### Firewall
+
+If the PICO cannot connect to the PC, the firewall is the most likely cause:
+
+```bash
+# Option A: Disable firewall entirely (easiest for development)
+sudo ufw disable
+
+# Option B: Allow only needed ports
+sudo ufw allow 6379/tcp    # Redis
+sudo ufw allow 5555/tcp    # ZMQ camera stream (if using ZED Mini)
+```
+
+### Port Reference
+
+| Port | Protocol | Purpose | Direction |
+|------|----------|---------|-----------|
+| 6379 | TCP | Redis (TWIST2 ↔ teleop_bridge) | localhost or LAN |
+| 5555 | TCP (ZMQ) | Camera video stream | G1 robot → PC |
+| XRoboToolkit internal | TCP | PICO body/hand tracking | PICO → PC (managed by PC Service) |
+
+### Startup Sequence (Checklist)
+
+```
+□ 1. Power on the G1 robot
+□ 2. Connect Ethernet cable (PC ↔ robot), verify: ping 192.168.123.164
+□ 3. Ensure PC and PICO are on the same WiFi
+□ 4. Start xrobotoolkit-pc-service app on PC
+□ 5. On PICO: open XRobot app → enter PC WiFi IP → Connect → Start streaming
+□ 6. Terminal 1: conda activate gmr && cd TWIST2 && bash teleop.sh
+     (you should see the MuJoCo visualization window)
+□ 7. In MuJoCo window, press right controller A to start teleop
+□ 8. Terminal 2: bash run_teleop.sh          (or: bash run_teleop.sh record)
+□ 9. The robot arms should now follow your VR hand movements
+```
+
+### VR Controller Button Map
+
+| Button | Hand | Action |
+|--------|------|--------|
+| **A** | Right | Start / pause teleop |
+| **B** | Right | Shrink streamed RGB in VR |
+| **X** | Left | Exit teleop → return to default pose |
+| **Index trigger** | Right | Close right hand |
+| **Grip** | Right | Open right hand |
+| **Index trigger** | Left | Close left hand |
+| **Grip** | Left | Open left hand |
+| **Axis click** | Left | Emergency stop (robot freezes) |
+
+### Configuration Summary
+
+Only **four things** need your actual input — everything else uses defaults:
+
+| What to configure | Where | Set to |
+|-------------------|-------|--------|
+| Redis bind address | `/etc/redis/redis.conf` | `bind 0.0.0.0` (if cross-machine) |
+| Your height | `TWIST2/teleop.sh` → `actual_human_height` | Your height in meters, ~5cm below actual |
+| Redis IP (if cross-machine) | `TWIST2/teleop.sh` → `redis_ip` | IP of Redis host |
+| PC WiFi IP | PICO XRobot app UI | Your PC's WiFi IP address |
 
 ---
 
