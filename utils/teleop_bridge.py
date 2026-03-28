@@ -65,6 +65,58 @@ ARM_SDK_ENABLE_IDX = 29
 
 N_HAND_MOTORS = 7
 
+# ─── Gravity Compensation ─────────────────────────────────────────────────
+# Pinocchio computes exact per-joint gravity torques from the URDF model and
+# current joint configuration. This keeps the waist upright and prevents arm
+# sag — the same approach used by teach.py, replay.py, and vla_client.py.
+
+URDF_PATH = (
+    "/home/humanoid-pc/unitree_rl_gym/resources/robots/"
+    "g1_description/g1_29dof_with_hand_rev_1_0.urdf"
+)
+
+UNITREE_TO_PIN = {}
+for _i in range(15):
+    UNITREE_TO_PIN[_i] = _i
+for _i in range(7):
+    UNITREE_TO_PIN[15 + _i] = 15 + _i
+    UNITREE_TO_PIN[22 + _i] = 29 + _i
+
+
+class GravityCompensator:
+    """Compute per-joint gravity torques using Pinocchio."""
+
+    def __init__(self):
+        self.available = False
+        try:
+            import pinocchio as pin
+            self.pin = pin
+            self.model = pin.buildModelFromUrdf(URDF_PATH)
+            self.data = self.model.createData()
+            self.neutral_q = pin.neutral(self.model)
+            self.available = True
+            print("Gravity compensation: ENABLED (Pinocchio + URDF)")
+        except Exception as e:
+            print(f"Gravity compensation: DISABLED ({e})")
+
+    def compute(self, low_state):
+        """Return {unitree_joint_idx: tau_ff} for arm + waist joints."""
+        if not self.available:
+            return {}
+        q = self.neutral_q.copy()
+        for u_idx, p_idx in UNITREE_TO_PIN.items():
+            if p_idx < self.model.nq:
+                q[p_idx] = low_state.motor_state[u_idx].q
+        G = self.pin.computeGeneralizedGravity(self.model, self.data, q)
+        tau_ff = {}
+        for j in ARM_JOINTS:
+            p_idx = UNITREE_TO_PIN[j]
+            tau_ff[j] = float(G[p_idx])
+        for j in WAIST_JOINTS:
+            p_idx = UNITREE_TO_PIN[j]
+            tau_ff[j] = float(G[p_idx])
+        return tau_ff
+
 # ─── Hand Finger Remapping ────────────────────────────────────────────────
 # TWIST2 uses `unitree_interface` (C++ binding) while our repo uses DDS
 # `rt/dex3/*/cmd` via `unitree_sdk2py`.  The two SDKs have DIFFERENT finger
@@ -103,12 +155,17 @@ CONTROL_DT = 1.0 / CONTROL_HZ
 # PD gains for position tracking during teleop
 KP_ARM = 60.0
 KD_ARM = 2.0
-KP_WAIST = 60.0
-KD_WAIST = 2.0
-KP_HAND = 1.5
-KD_HAND = 0.2
+KP_WAIST = 200.0
+KD_WAIST = 5.0
+KP_HAND = 1.0
+KD_HAND = 0.3
 
-MAX_DELTA_PER_STEP = 0.08  # rad — conservative limit per 50Hz step
+MAX_DELTA_PER_STEP = 0.15  # rad per 50Hz step ≈ 430°/s max
+
+# Exponential Moving Average (EMA) smoothing to reduce jitter from VR noise.
+# alpha=1.0 means no smoothing; lower values = heavier smoothing.
+EMA_ALPHA_ARM = 0.6
+EMA_ALPHA_HAND = 0.4
 
 # Joint limits from URDF (radians)
 JOINT_LIMITS = {
@@ -210,9 +267,29 @@ def clamp_joints(positions, last_positions=None):
     return clamped
 
 
-def clamp_hand(hand_positions, lo=-0.5, hi=1.5):
-    """Clamp hand motor positions to safe range."""
-    return np.clip(hand_positions, lo, hi)
+HAND_LIMITS_LEFT_MIN = np.array([-1.0472, -0.7243, 0.0, -1.5708, -1.7453, -1.5708, -1.7453])
+HAND_LIMITS_LEFT_MAX = np.array([1.0472, 1.0472, 1.7453, 0.0, 0.0, 0.0, 0.0])
+HAND_LIMITS_RIGHT_MIN = np.array([-1.0472, -1.0472, -1.7453, 0.0, 0.0, 0.0, 0.0])
+HAND_LIMITS_RIGHT_MAX = np.array([1.0472, 0.7243, 0.0, 1.5708, 1.7453, 1.5708, 1.7453])
+
+
+def ema_smooth(new_val, prev_val, alpha):
+    """Exponential moving average: out = alpha * new + (1 - alpha) * prev."""
+    if prev_val is None:
+        return new_val
+    return alpha * new_val + (1.0 - alpha) * prev_val
+
+
+def clamp_hand_left(hand_positions):
+    """Clamp left hand motor positions to per-motor limits (DDS ordering)."""
+    remapped_min = np.array([HAND_LIMITS_LEFT_MIN[i] for i in HAND_REMAP_LEFT])
+    remapped_max = np.array([HAND_LIMITS_LEFT_MAX[i] for i in HAND_REMAP_LEFT])
+    return np.clip(hand_positions, remapped_min, remapped_max)
+
+
+def clamp_hand_right(hand_positions):
+    """Clamp right hand motor positions to per-motor limits (DDS ordering)."""
+    return np.clip(hand_positions, HAND_LIMITS_RIGHT_MIN, HAND_LIMITS_RIGHT_MAX)
 
 
 # ─── Redis Reader ─────────────────────────────────────────────────────────
@@ -322,7 +399,7 @@ class MockRedisReader:
 class RobotSender:
     """Send commands to G1 via DDS (rt/arm_sdk + rt/dex3)."""
 
-    def __init__(self, network=None, include_waist=False):
+    def __init__(self, network=None, include_waist=False, grav_comp=None):
         from unitree_sdk2py.core.channel import (
             ChannelFactoryInitialize,
             ChannelPublisher,
@@ -337,14 +414,11 @@ class RobotSender:
         )
         from unitree_sdk2py.utils.crc import CRC
 
-        if network:
-            ChannelFactoryInitialize(0, network)
-        else:
-            ChannelFactoryInitialize(0)
-
         self._include_waist = include_waist
+        self._grav_comp = grav_comp
         self.crc = CRC()
         self.low_state = None
+        self.mode_machine = 0
         self._lock = threading.Lock()
 
         self.arm_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
@@ -362,6 +436,7 @@ class RobotSender:
     def _on_state(self, msg):
         with self._lock:
             self.low_state = msg
+            self.mode_machine = msg.mode_machine
 
     def wait_for_state(self, timeout=5.0):
         t0 = time.time()
@@ -386,13 +461,17 @@ class RobotSender:
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 
         cmd = unitree_hg_msg_dds__LowCmd_()
+        cmd.mode_pr = 0
+        with self._lock:
+            cmd.mode_machine = self.mode_machine
+            grav = (self._grav_comp.compute(self.low_state)
+                    if self._grav_comp and self.low_state else {})
         cmd.motor_cmd[ARM_SDK_ENABLE_IDX].q = 1.0
 
-        # rt/arm_sdk requires all 17 joints; lock waist at 0 if arms-only
         for j in ARM_SDK_JOINTS:
             cmd.motor_cmd[j].mode = 1
             cmd.motor_cmd[j].dq = 0.0
-            cmd.motor_cmd[j].tau = 0.0
+            cmd.motor_cmd[j].tau = grav.get(j, 0.0)
             if j in WAIST_JOINTS and not self._include_waist:
                 cmd.motor_cmd[j].q = 0.0
                 cmd.motor_cmd[j].kp = KP_WAIST
@@ -431,8 +510,10 @@ class RobotSender:
         for i in range(steps):
             w = 1.0 - (i / steps)
             cmd = unitree_hg_msg_dds__LowCmd_()
+            cmd.mode_pr = 0
             cmd.motor_cmd[ARM_SDK_ENABLE_IDX].q = w
             with self._lock:
+                cmd.mode_machine = self.mode_machine
                 if self.low_state:
                     for j in ARM_SDK_JOINTS:
                         cmd.motor_cmd[j].mode = 1
@@ -573,6 +654,8 @@ class TeleopBridge:
         self._include_waist = include_waist
         self._stop = False
         self._last_positions = None
+        self._smooth_left_hand = None
+        self._smooth_right_hand = None
 
         self.stats = {
             "frames_read": 0,
@@ -603,6 +686,11 @@ class TeleopBridge:
             print("WARNING: No robot state received, using zeros as baseline.")
         self._last_positions = self.sender.get_current_positions()
 
+        init_l = [self._last_positions.get(j, 0.0) for j in LEFT_ARM_JOINTS]
+        init_r = [self._last_positions.get(j, 0.0) for j in RIGHT_ARM_JOINTS]
+        print(f"  Robot initial L arm: [{', '.join(f'{v:.3f}' for v in init_l)}]")
+        print(f"  Robot initial R arm: [{', '.join(f'{v:.3f}' for v in init_r)}]")
+
         if self.recorder:
             key_pressed = [False]
 
@@ -619,6 +707,8 @@ class TeleopBridge:
         self.stats["start_time"] = time.time()
         print("Bridge running. Waiting for TWIST2 teleop data...\n")
 
+        _diag_count = 0
+
         while not self._stop:
             t_start = time.time()
 
@@ -631,8 +721,34 @@ class TeleopBridge:
                 continue
 
             positions = clamp_joints(frame.upper_body, self._last_positions)
-            left_hand = clamp_hand(frame.left_hand)
-            right_hand = clamp_hand(frame.right_hand)
+
+            # EMA smoothing on arm positions to reduce VR tracking jitter
+            if self._last_positions is not None:
+                for j in positions:
+                    if j in self._last_positions:
+                        positions[j] = ema_smooth(
+                            positions[j], self._last_positions[j], EMA_ALPHA_ARM
+                        )
+
+            left_hand = clamp_hand_left(frame.left_hand)
+            right_hand = clamp_hand_right(frame.right_hand)
+
+            # EMA smoothing on hand motor commands
+            self._smooth_left_hand = ema_smooth(
+                left_hand, self._smooth_left_hand, EMA_ALPHA_HAND
+            )
+            self._smooth_right_hand = ema_smooth(
+                right_hand, self._smooth_right_hand, EMA_ALPHA_HAND
+            )
+            left_hand = self._smooth_left_hand
+            right_hand = self._smooth_right_hand
+
+            if _diag_count < 5:
+                tgt_l = [frame.upper_body.get(j, 0.0) for j in LEFT_ARM_JOINTS[:4]]
+                cmd_l = [positions.get(j, 0.0) for j in LEFT_ARM_JOINTS[:4]]
+                print(f"  [frame {_diag_count}] target L={[f'{v:.3f}' for v in tgt_l]}  "
+                      f"cmd L={[f'{v:.3f}' for v in cmd_l]}")
+                _diag_count += 1
 
             self.sender.send_arm(positions)
             self.sender.send_hands(left_hand, right_hand)
@@ -680,6 +796,64 @@ class TeleopBridge:
         print(f"  Frames invalid: {self.stats['frames_invalid']}")
         if elapsed > 0:
             print(f"  Average FPS: {self.stats['frames_sent'] / elapsed:.1f}")
+
+
+def ensure_ai_mode():
+    """Check that the locomotion controller (ai sport) is active.
+
+    rt/arm_sdk requires the Unitree balance controller to be running.
+    Start the robot with the hand controller:
+      1. L1 + A   — power on
+      2. L1 + UP  — stand up
+    """
+    from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+        MotionSwitcherClient,
+    )
+
+    msc = MotionSwitcherClient()
+    msc.SetTimeout(5.0)
+    msc.Init()
+
+    code, result = msc.CheckMode()
+    current = result.get("name", "") if result else ""
+    print(f"Current mode: '{current}' (form={result})")
+
+    if current == "ai":
+        print("OK — locomotion controller is active.")
+        return True
+
+    print("ai mode not detected. Attempting SelectMode('ai')...")
+    code, _ = msc.SelectMode("ai")
+    print(f"  SelectMode returned code={code}")
+    time.sleep(3)
+
+    code, result = msc.CheckMode()
+    current = result.get("name", "") if result else ""
+    print(f"  Mode after select: '{current}'")
+
+    if current == "ai":
+        from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+        loco = LocoClient()
+        loco.SetTimeout(5.0)
+        loco.Init()
+        ret = loco.SetFsmId(200)
+        print(f"  LocoClient.SetFsmId(200) returned: {ret}")
+        time.sleep(3)
+        return True
+
+    print("\n" + "!" * 50)
+    print("  WARNING: Balance controller NOT active!")
+    print("!" * 50)
+    print("\nPlease start the robot with the hand controller:")
+    print("  1. L1 + A    — power on")
+    print("  2. L1 + UP   — stand up")
+    print("  3. Robot should be standing and balanced")
+    print("  4. Then re-run this script")
+    print("\nIf in debug mode (L2+R2), reboot the robot.")
+    print("")
+
+    ans = input("Continue anyway? (y/N): ").strip().lower()
+    return ans == "y"
 
 
 def main():
@@ -735,9 +909,20 @@ def main():
         reader = MockRedisReader(motion=args.mock_motion, include_waist=args.with_waist)
         sender = MockRobotSender(include_waist=args.with_waist)
     else:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        if args.network:
+            ChannelFactoryInitialize(0, args.network)
+        else:
+            ChannelFactoryInitialize(0)
+
+        if not ensure_ai_mode():
+            print("Aborted.")
+            sys.exit(1)
+        grav_comp = GravityCompensator()
         reader = RedisReader(host=args.redis_ip, port=args.redis_port,
                              include_waist=args.with_waist)
-        sender = RobotSender(network=args.network, include_waist=args.with_waist)
+        sender = RobotSender(network=args.network, include_waist=args.with_waist,
+                             grav_comp=grav_comp)
 
     recorder = None
     if args.record:
