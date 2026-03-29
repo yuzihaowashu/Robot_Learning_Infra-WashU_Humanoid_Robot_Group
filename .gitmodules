@@ -9,4 +9,4 @@
 	url = git@github.com:amazon-far/TWIST2.git
 [submodule "xr_teleoperate"]
 	path = xr_teleoperate
-	url = git@github.com:unitreerobotics/xr_teleoperate.git
+	url = git@github.com:yuzihaowashu/xr_teleoperate.git
