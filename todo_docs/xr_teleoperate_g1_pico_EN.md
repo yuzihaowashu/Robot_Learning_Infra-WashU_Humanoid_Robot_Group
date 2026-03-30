@@ -35,7 +35,7 @@ Hardware: Unitree G1 (29-DOF arms, Dex3 hands) + PICO 4 Ultra Enterprise VR + hu
 ### Phase 3: Teleop debugging ✅ (basic validation)
 
 #### 3.1 Robot standing + tracking
-- **Important**: G1 must be standing (L1+A → L1+UP) before starting xr_teleoperate
+- **Important**: G1 must be standing (L2 + Y and L2 + B, L2 + UP, R1 + X) before starting xr_teleoperate
   - Otherwise non-arm joints stay locked in seated pose, causing arms to reach forward and ~90° waist twist
 
 #### 3.2 VR black screen fix
