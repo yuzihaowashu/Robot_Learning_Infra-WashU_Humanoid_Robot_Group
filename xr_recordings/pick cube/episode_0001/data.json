@@ -1,0 +1,43 @@
+{
+"info": {
+    "version": "1.0.0",
+    "date": "2026-03-29",
+    "author": "unitree",
+    "image": {
+        "width": 640,
+        "height": 480,
+        "fps": 30.0
+    },
+    "depth": {
+        "width": 640,
+        "height": 480,
+        "fps": 30.0
+    },
+    "audio": {
+        "sample_rate": 16000,
+        "channels": 1,
+        "format": "PCM",
+        "bits": 16
+    },
+    "joint_names": {
+        "left_arm": [],
+        "left_ee": [],
+        "right_arm": [],
+        "right_ee": [],
+        "body": []
+    },
+    "tactile_names": {
+        "left_ee": [],
+        "right_ee": []
+    },
+    "sim_state": ""
+},
+"text": {
+    "goal": "pick up cube.",
+    "desc": "task description",
+    "steps": "step1: do this; step2: do that;"
+},
+"data": [
+
+]
+}
