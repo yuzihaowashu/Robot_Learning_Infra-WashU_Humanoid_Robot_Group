@@ -10,3 +10,6 @@
 [submodule "xr_teleoperate"]
 	path = xr_teleoperate
 	url = git@github.com:yuzihaowashu/xr_teleoperate.git
+[submodule "Psi0"]
+	path = Psi0
+	url = https://github.com/physical-superintelligence-lab/Psi0.git
