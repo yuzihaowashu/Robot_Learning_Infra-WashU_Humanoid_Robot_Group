@@ -10,6 +10,7 @@ Usage:
     python gradio_panel.py
 """
 
+import atexit
 import os
 import sys
 import json
@@ -24,20 +25,52 @@ import gradio as gr
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 XR_DIR = os.path.join(ROOT_DIR, "xr_teleoperate", "teleop")
 RECORDINGS_DIR = os.path.join(ROOT_DIR, "xr_recordings")
+TELEOP_LOG = os.path.join(ROOT_DIR, "teleop_latest.log")
 
 sys.path.insert(0, os.path.join(ROOT_DIR, "xr_teleoperate"))
+
+
+def _get_local_ips():
+    """Return list of non-loopback IPv4 addresses."""
+    import socket
+    ips = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            ips.append("<PC-IP>")
+    return list(dict.fromkeys(ips))
+
+
+LOCAL_IPS = _get_local_ips()
 
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 _teleop_proc: subprocess.Popen | None = None
+_teleop_log_fh = None
 _ipc_client = None
 _ipc_lock = threading.Lock()
+_current_task_name = "pick_apple"
 
 
 def _get_ipc_client():
+    """Only create IPC client when teleop process is actually running."""
     global _ipc_client
     with _ipc_lock:
+        proc_alive = _teleop_proc is not None and _teleop_proc.poll() is None
+        if not proc_alive:
+            return None
         if _ipc_client is None:
             try:
                 from teleop.utils.ipc import IPC_Client
@@ -61,11 +94,41 @@ def _destroy_ipc_client():
 # ---------------------------------------------------------------------------
 # Process management
 # ---------------------------------------------------------------------------
+def _kill_stale_teleop():
+    """Find and kill any leftover teleop_hand_and_arm.py processes."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "teleop_hand_and_arm.py"],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return
+    for pid_str in out.splitlines():
+        pid = int(pid_str.strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(1)
+    for pid_str in out.splitlines():
+        pid = int(pid_str.strip())
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+_kill_stale_teleop()
+
+
 def launch_teleop(task_name, task_goal, task_desc, task_steps, input_mode, motion):
-    global _teleop_proc
+    global _teleop_proc, _teleop_log_fh, _current_task_name
+    _current_task_name = task_name
+
     if _teleop_proc is not None and _teleop_proc.poll() is None:
         return "Teleop process is already running."
 
+    _kill_stale_teleop()
     _destroy_ipc_client()
 
     cmd = [
@@ -83,13 +146,12 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, input_mode, motio
     if motion:
         cmd.append("--motion")
 
+    _teleop_log_fh = open(TELEOP_LOG, "w")
     _teleop_proc = subprocess.Popen(
         cmd,
         cwd=XR_DIR,
-        stdout=subprocess.PIPE,
+        stdout=_teleop_log_fh,
         stderr=subprocess.STDOUT,
-        text=True,
-        preexec_fn=os.setsid,
     )
 
     for _ in range(40):
@@ -101,31 +163,105 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, input_mode, motio
 
 
 def stop_teleop():
-    global _teleop_proc
+    global _teleop_proc, _teleop_log_fh
     client = _get_ipc_client()
     if client and client.is_online():
         try:
             client.send_data("CMD_STOP")
         except Exception:
             pass
-    time.sleep(0.5)
+    # give the process time to run go_home (~6s) before killing
+    for _ in range(20):
+        time.sleep(0.5)
+        if _teleop_proc is None or _teleop_proc.poll() is not None:
+            break
     if _teleop_proc is not None and _teleop_proc.poll() is None:
         try:
-            os.killpg(os.getpgid(_teleop_proc.pid), signal.SIGTERM)
+            _teleop_proc.send_signal(signal.SIGTERM)
         except Exception:
             pass
-        _teleop_proc.wait(timeout=5)
+        try:
+            _teleop_proc.wait(timeout=8)
+        except Exception:
+            try:
+                _teleop_proc.kill()
+            except Exception:
+                pass
     _teleop_proc = None
+    if _teleop_log_fh is not None:
+        try:
+            _teleop_log_fh.close()
+        except Exception:
+            pass
+        _teleop_log_fh = None
     _destroy_ipc_client()
     return "Teleop stopped."
 
 
+def reset_arms():
+    """Spread arms outward, then slowly release. Skip if already relaxed."""
+    try:
+        result = subprocess.run(
+            ["python", "-c", "\n".join([
+                "import sys, time, numpy as np",
+                f"sys.path.insert(0, '{os.path.join(ROOT_DIR, 'xr_teleoperate')}')",
+                f"sys.path.insert(0, '{XR_DIR}')",
+                "from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber",
+                "from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as hg_LowCmd, LowState_ as hg_LowState",
+                "from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_",
+                "from unitree_sdk2py.utils.crc import CRC",
+                "ChannelFactoryInitialize(0)",
+                "",
+                "# Quick check: read arm state to see if arms are already relaxed",
+                "sub = ChannelSubscriber('rt/lowstate', hg_LowState)",
+                "sub.Init()",
+                "time.sleep(0.3)",
+                "state = sub.Read()",
+                "if state is not None:",
+                "    arm_ids = [15,16,17,18,19,20,21, 22,23,24,25,26,27,28]",
+                "    arm_q = [abs(state.motor_state[i].q) for i in arm_ids]",
+                "    if max(arm_q) < 0.15:",
+                "        print('Arms already near rest. OK')",
+                "        sys.exit(0)",
+                "",
+                "# Arms are NOT relaxed — do the safe release sequence",
+                "from teleop.robot_control.robot_arm import G1_29_ArmController",
+                "arm = G1_29_ArmController(motion_mode=True, safe_deploy=False)",
+                "",
+                "# Use go_home which now does: spread → q=0 → slow ramp down",
+                "arm.ctrl_dual_arm_go_home()",
+                "print('OK')",
+            ])],
+            capture_output=True, text=True, timeout=20,
+            cwd=XR_DIR,
+        )
+        if "OK" in result.stdout:
+            return "[OK] Arms relaxed safely."
+        return f"[ERROR] {result.stderr[:200] if result.stderr else 'Unknown error'}"
+    except subprocess.TimeoutExpired:
+        return "[ERROR] Arm release timed out (20s)."
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+
+_CMD_LABELS = {
+    "CMD_START": "Start Tracking",
+    "CMD_STOP": "Emergency Stop",
+    "CMD_RECORD_TOGGLE": "Toggle Recording",
+    "CMD_LOCO_TOGGLE": "Toggle Locomotion",
+}
+
+
 def send_ipc_cmd(cmd: str):
+    label = _CMD_LABELS.get(cmd, cmd)
     client = _get_ipc_client()
     if client is None or not client.is_online():
-        return f"Cannot send {cmd}: IPC offline."
+        return f"[FAILED] {label}: IPC offline — is teleop launched (Step 2)?"
     reply = client.send_data(cmd)
-    return f"{cmd} -> {reply.get('status', 'unknown')}"
+    status = reply.get("status", "unknown")
+    if status == "ok":
+        return f"[OK] {label} — command sent successfully"
+    return f"[ERROR] {label}: {reply.get('msg', status)}"
 
 
 def ipc_start():
@@ -145,10 +281,16 @@ def ipc_loco_toggle():
 
 
 # ---------------------------------------------------------------------------
-# Status polling
+# Status polling (returns status HTML + episode rows + event log)
 # ---------------------------------------------------------------------------
-def poll_status():
+_last_seen_events = 0
+
+
+def poll_status_and_episodes():
+    global _last_seen_events
     proc_alive = _teleop_proc is not None and _teleop_proc.poll() is None
+    if not proc_alive and _ipc_client is not None:
+        _destroy_ipc_client()
     client = _get_ipc_client() if proc_alive else None
     online = client.is_online() if client else False
     state = client.latest_state() if (client and online) else {}
@@ -166,7 +308,7 @@ def poll_status():
     tracking_html = _badge("TRACKING", "green") if state.get("START") else _badge("WAITING", "orange")
     loco_html = _badge("WALK ON", "green") if state.get("LOCO_ENABLED") else _badge("WALK OFF", "gray")
 
-    html = f"""
+    status_html = f"""
     <div style="display:flex; gap:18px; align-items:center; flex-wrap:wrap; padding:6px 0;">
         <span><b>Process:</b> {proc_html}</span>
         <span><b>IPC:</b> {ipc_html}</span>
@@ -174,7 +316,17 @@ def poll_status():
         <span><b>Recording:</b> {rec_html}</span>
         <span><b>Locomotion:</b> {loco_html}</span>
     </div>"""
-    return html
+
+    events = state.get("EVENTS", [])
+    if events:
+        lines = "\n".join(events[-10:])
+    elif not proc_alive:
+        lines = "(teleop not running)"
+    else:
+        lines = "(waiting for events...)"
+
+    episodes = refresh_episodes(_current_task_name)
+    return status_html, episodes, lines
 
 
 def _badge(text, color):
@@ -238,84 +390,178 @@ def refresh_episodes(task_name):
     return rows
 
 
+def _update_task_name(name):
+    global _current_task_name
+    _current_task_name = name
+    return refresh_episodes(name)
+
+
 # ---------------------------------------------------------------------------
-# Gradio UI
+# Gradio UI — step-based layout
 # ---------------------------------------------------------------------------
+_CSS = """
+.emergency-btn {
+    background: #dc2626 !important;
+    color: white !important;
+    font-weight: bold !important;
+    font-size: 16px !important;
+}
+.launch-btn {
+    background: #16a34a !important;
+    color: white !important;
+    font-weight: bold !important;
+}
+.step-title {
+    margin: 0 0 4px 0 !important;
+    padding: 0 !important;
+}
+"""
+
+
 def build_ui():
     with gr.Blocks(
         title="XR Teleoperate Control Panel",
-        theme=gr.themes.Soft(),
-        css="""
-        .emergency-btn {background: #dc2626 !important; color: white !important; font-weight: bold !important; font-size: 16px !important;}
-        .launch-btn {background: #16a34a !important; color: white !important; font-weight: bold !important;}
-        """,
+        css=_CSS,
     ) as demo:
         gr.Markdown("# XR Teleoperate Control Panel")
 
-        status_html = gr.HTML(value=poll_status(), label="Status")
-        pc2_html = gr.HTML(value=check_pc2(), label="PC2")
+        # ---- live status bar (always visible at top) ----
+        status_html = gr.HTML(value="", label="Status")
 
-        timer = gr.Timer(value=0.8)
-        timer.tick(fn=poll_status, outputs=status_html)
-
-        with gr.Row():
-            # ---- Left column: Task configuration ----
-            with gr.Column(scale=1):
-                gr.Markdown("### Task Configuration")
-                task_name = gr.Textbox(label="Task Name", value="pick_apple", placeholder="e.g. pick_apple")
-                task_goal = gr.Textbox(label="Task Goal", value="Pick up the apple from the table.", placeholder="Short description of the goal")
-                task_desc = gr.Textbox(label="Task Description", value="", placeholder="Detailed description (optional)", lines=2)
-                task_steps = gr.Textbox(label="Task Steps", value="", placeholder="step1: ...; step2: ...;", lines=2)
-                input_mode = gr.Radio(["controller", "hand"], label="Input Mode", value="controller")
-                motion_flag = gr.Checkbox(label="Enable Locomotion (--motion)", value=True)
-
-                with gr.Row():
-                    launch_btn = gr.Button("Launch Teleop", variant="primary", elem_classes=["launch-btn"])
-                    stop_btn = gr.Button("Stop Teleop", variant="stop")
-
-                launch_output = gr.Textbox(label="Output", interactive=False, lines=2)
-
-                launch_btn.click(
-                    fn=launch_teleop,
-                    inputs=[task_name, task_goal, task_desc, task_steps, input_mode, motion_flag],
-                    outputs=launch_output,
+        # ==================================================================
+        # Step 1: Configure Task
+        # ==================================================================
+        with gr.Group():
+            gr.Markdown("## Step 1 — Configure Task", elem_classes=["step-title"])
+            with gr.Row():
+                task_name = gr.Textbox(
+                    label="Task Name", value="pick_apple",
+                    placeholder="e.g. pick_apple", scale=1,
                 )
-                stop_btn.click(fn=stop_teleop, outputs=launch_output)
-
-            # ---- Right column: Live control + history ----
-            with gr.Column(scale=1):
-                gr.Markdown("### Live Control")
-                with gr.Row():
-                    start_btn = gr.Button("Start Tracking (r)", variant="primary")
-                    rec_btn = gr.Button("Toggle Recording (s)", variant="secondary")
-                with gr.Row():
-                    loco_btn = gr.Button("Toggle Locomotion (m)", variant="secondary")
-                ctrl_output = gr.Textbox(label="Command Result", interactive=False, lines=1)
-                start_btn.click(fn=ipc_start, outputs=ctrl_output)
-                rec_btn.click(fn=ipc_record_toggle, outputs=ctrl_output)
-                loco_btn.click(fn=ipc_loco_toggle, outputs=ctrl_output)
-
-                estop_btn = gr.Button("EMERGENCY STOP (q)", elem_classes=["emergency-btn"], size="lg")
-                estop_btn.click(fn=ipc_stop, outputs=ctrl_output)
-
-                gr.Markdown("### Episode History")
-                episode_table = gr.Dataframe(
-                    headers=["Episode", "Date", "Frames", "Goal"],
-                    value=refresh_episodes("pick_apple"),
-                    interactive=False,
-                    wrap=True,
+                task_goal = gr.Textbox(
+                    label="Task Goal",
+                    value="Pick up the apple from the table.",
+                    placeholder="Short goal description", scale=2,
                 )
-                refresh_btn = gr.Button("Refresh Episodes")
-                refresh_btn.click(fn=refresh_episodes, inputs=task_name, outputs=episode_table)
-                task_name.change(fn=refresh_episodes, inputs=task_name, outputs=episode_table)
+            with gr.Row():
+                task_desc = gr.Textbox(
+                    label="Task Description", value="",
+                    placeholder="Detailed description (optional)", lines=2, scale=2,
+                )
+                task_steps = gr.Textbox(
+                    label="Task Steps", value="",
+                    placeholder="step1: ...; step2: ...;", lines=2, scale=2,
+                )
+            with gr.Row():
+                input_mode = gr.Radio(
+                    ["controller", "hand"], label="Input Mode",
+                    value="controller", scale=1,
+                )
+                motion_flag = gr.Checkbox(
+                    label="Enable Locomotion (--motion)", value=True, scale=1,
+                )
 
-        with gr.Accordion("Network", open=False):
-            pc2_refresh_btn = gr.Button("Check PC2 Connectivity")
-            pc2_refresh_btn.click(fn=check_pc2, outputs=pc2_html)
+        # ==================================================================
+        # Step 2: Launch and Connect
+        # ==================================================================
+        with gr.Group():
+            gr.Markdown("## Step 2 — Launch and Connect", elem_classes=["step-title"])
+            gr.Markdown(
+                "**Before launching, make sure:**\n"
+                "1. Robot G1 is **standing up** (use remote controller)\n"
+                "2. PC2 teleimager is running: `ssh unitree@192.168.123.164` → `cd ~/teleimager` → `conda activate teleimager` → `teleimager-server`\n"
+                "3. PICO VR is on and connected by wire / to the same WiFi"
+            )
+            with gr.Row():
+                launch_btn = gr.Button(
+                    "Launch Teleop", variant="primary",
+                    elem_classes=["launch-btn"], scale=2,
+                )
+                stop_btn = gr.Button("Stop Teleop", variant="stop", scale=1)
+                reset_btn = gr.Button("Relax Arms", variant="secondary", scale=1)
+                pc2_btn = gr.Button("Check PC2", scale=1)
+
+            launch_output = gr.Textbox(label="Output", interactive=False, lines=2)
+            pc2_html = gr.HTML(value="", label="PC2 Status")
+
+            launch_btn.click(
+                fn=launch_teleop,
+                inputs=[task_name, task_goal, task_desc, task_steps, input_mode, motion_flag],
+                outputs=launch_output,
+            )
+            stop_btn.click(fn=stop_teleop, outputs=launch_output)
+            reset_btn.click(fn=reset_arms, outputs=launch_output)
+            pc2_btn.click(fn=check_pc2, outputs=pc2_html)
+
+        # ==================================================================
+        # Step 3: Control and Record
+        # ==================================================================
+        with gr.Group():
+            gr.Markdown("## Step 3 — Control and Record", elem_classes=["step-title"])
+            gr.Markdown(
+                "**PICO VR:** Open browser → `https://192.168.0.89:8012` → Enter VR\n\n"
+                "**Workflow (repeat for each episode):**\n"
+                "1. Click **Start Tracking** → robot arms follow VR controllers\n"
+                "2. Click **Toggle Recording** → recording starts (status shows ● REC)\n"
+                "3. Perform the task\n"
+                "4. Click **Toggle Recording** again → episode saved, arms return home\n"
+                "5. Repeat from step 2 for the next episode (no need to re-launch)\n\n"
+                "*Locomotion is OFF by default. Click Toggle Locomotion to enable walking.*"
+            )
+            with gr.Row():
+                start_btn = gr.Button("Start Tracking (r)", variant="primary", scale=2)
+                rec_btn = gr.Button("Toggle Recording (s)", variant="secondary", scale=2)
+                loco_btn = gr.Button("Toggle Locomotion (m)", variant="secondary", scale=2)
+
+            estop_btn = gr.Button(
+                "EMERGENCY STOP (q)",
+                elem_classes=["emergency-btn"], size="lg",
+            )
+
+            ctrl_output = gr.Textbox(label="Command Result", interactive=False, lines=1)
+
+            start_btn.click(fn=ipc_start, outputs=ctrl_output)
+            rec_btn.click(fn=ipc_record_toggle, outputs=ctrl_output)
+            loco_btn.click(fn=ipc_loco_toggle, outputs=ctrl_output)
+            estop_btn.click(fn=ipc_stop, outputs=ctrl_output)
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### Episode History (auto-refreshes)")
+                    episode_table = gr.Dataframe(
+                        headers=["Episode", "Date", "Frames", "Goal"],
+                        value=refresh_episodes("pick_apple"),
+                        interactive=False,
+                        wrap=True,
+                    )
+                    refresh_btn = gr.Button("Refresh Episodes")
+                    refresh_btn.click(fn=refresh_episodes, inputs=task_name, outputs=episode_table)
+                    task_name.change(fn=_update_task_name, inputs=task_name, outputs=episode_table)
+
+                with gr.Column(scale=1):
+                    gr.Markdown("### Event Log (live)")
+                    event_log = gr.Textbox(
+                        value="(teleop not running)",
+                        interactive=False, lines=10,
+                        show_label=False, max_lines=12,
+                    )
+
+        # ---- timer: auto-refresh status + episodes + events every 1.5 s ----
+        timer = gr.Timer(value=1.5)
+        timer.tick(fn=poll_status_and_episodes, outputs=[status_html, episode_table, event_log])
 
     return demo
 
 
+def _atexit_cleanup():
+    try:
+        stop_teleop()
+    except Exception:
+        pass
+    _kill_stale_teleop()
+
+
 if __name__ == "__main__":
+    atexit.register(_atexit_cleanup)
     demo = build_ui()
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
