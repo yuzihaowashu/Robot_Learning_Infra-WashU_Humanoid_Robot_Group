@@ -70,9 +70,22 @@
 - Right thumb (motors 1,2) returns to open slowly (settles at ~0.27 rad offset), likely due to kp=1.0 being insufficient to fully overcome mechanical friction in the thumb assembly
 - Temperature range for working motors: 35–47°C (normal operating range)
 
-### Additional Issue: Left Wrist Pitch (Motor 20) Overheating
+### Critical Issue: Left Wrist Pitch (Motor 20) — Permanent Hardware Fault
 
-During earlier teleoperation testing (same session), the left wrist pitch arm motor (not a hand motor) overheated to 129°C and entered thermal shutdown (mode=0). This was caused by the IK solver driving the wrist to extreme angles during teleoperation. A software safety mechanism (temperature monitoring + auto-disable at 85°C) has been added to prevent recurrence.
+**Timeline:**
+1. During teleop testing, IK solver drove wrist to extreme angle → motor overheated to **129°C** → entered thermal shutdown (mode=0)
+2. Software safety added: temperature monitoring + auto-disable at 85°C + URDF joint clipping
+3. After robot restart (2026-03-28): motor appeared normal (mode=1, temp=[49,46]) but was **physically unstable** — light touch caused it to snap to **+1.854 rad (+106.2°)** and lock there
+4. Neither `rt/arm_sdk` nor `rt/lowcmd` commands can move it — motor reads position but **cannot produce torque**
+5. The fault cascades: once motor 20 locks up, other arm joints begin drifting under gravity (no holding torque), suggesting the robot's internal arm controller also fails
+
+**Diagnosis:** The 129°C overheating event likely caused permanent damage to the motor driver or winding. The motor encoder works (reads position), but the drive stage is dead (zero torque output). This is a **hardware replacement** issue.
+
+**Symptoms:**
+- `mode=1` (firmware thinks it's OK), `temp=[49,46]` (normal)
+- `q=+1.854 rad` stuck, `dq≈0` — completely unresponsive to PD commands (kp=40)
+- Physical perturbation causes immediate snap to mechanical limit
+- Other arm joints gradually drift once motor 20 is stuck (loss of overall arm control)
 
 ---
 
@@ -98,10 +111,15 @@ Note: left and right hands have different middle/index ordering in the DDS messa
 
 ## Recommended Actions
 
-1. **Inspect wiring** for left thumb (3 motors) and right index finger (2 motors) — check connectors at the hand PCB and the motor cable harness
-2. **Check driver board** — the temp=0°C pattern suggests the motor driver is not communicating, not just that the motor is mechanically stuck
-3. **Test with Unitree's official hand test tool** if available, to rule out our software
-4. **Contact Unitree support** with this report if wiring inspection does not resolve the issue
+### Priority 1: Left Wrist Pitch Motor (Motor 20) — Arm Motor
+1. **Do NOT physically touch/push the left wrist** — motor 20 cannot hold position and will snap to limit
+2. **Motor replacement required** — the 129°C thermal event caused permanent drive-stage damage
+3. **Contact Unitree support** with this report, specifically mentioning the thermal shutdown history and current zero-torque symptom
+
+### Priority 2: Dex3-1 Hand Motors (5 dead)
+4. **Inspect wiring** for left thumb (3 motors) and right index finger (2 motors) — check connectors at the hand PCB and the motor cable harness
+5. **Check driver board** — the temp=0°C pattern suggests the motor driver is not communicating, not just that the motor is mechanically stuck
+6. **Test with Unitree's official hand test tool** if available, to rule out our software
 
 ---
 
