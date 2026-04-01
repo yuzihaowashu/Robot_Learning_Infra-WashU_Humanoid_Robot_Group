@@ -1,0 +1,103 @@
+# 遥操作启动命令速查
+# =====================
+
+## 前提条件
+- G1 机器人已开机，站立模式 (L2+B)
+- humanoid-pc 与 PICO 4U 在同一 WiFi 网络
+- 确认 WiFi IP: hostname -I
+
+## Step 1: PC2 启动相机流 (一个终端)
+ssh unitree@192.168.123.164
+conda activate teleimager && teleimager-server
+
+## Step 2: Host 启动 Gradio 面板 (一个终端)
+cd /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group
+conda activate tv
+python gradio_panel.py
+# 打开浏览器 http://localhost:7860
+
+## Step 3: PICO 4U
+# 打开 PICO 浏览器，访问 https://<WiFi_IP>:8012
+# 点击 "Enter VR" 进入沉浸模式
+
+## Step 4: Gradio 面板操作
+# 1. 填写 Task Name / Task Goal
+# 2. 选择 Input Mode: controller (扳机控制手指) 或 hand (手部追踪)
+# 3. 勾选 Motion 如需要行走
+# 4. 点击 "Launch Teleop"
+# 5. VR 中按 X 键开始遥操作
+# 6. VR 中按 A 键切换录制 (开始/停止)
+# 7. 完成后在面板点击 "Stop Teleop"
+# 8. 如手臂没放下，点击 "Relax Arms"
+
+# =====================
+# 直接命令行启动 (不用 Gradio)
+# =====================
+
+## Controller 模式 (扳机控制手指):
+cd /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group/xr_teleoperate/teleop
+conda activate tv
+python teleop_hand_and_arm.py \
+    --arm=G1_29 --ee=dex3 \
+    --input-mode=controller \
+    --record \
+    --task-dir=../../xr_recordings \
+    --task-name="pick_apple" \
+    --task-goal="pick up the apple" \
+    --motion
+
+## Hand Tracking + DexPilot (默认 retargeting):
+python teleop_hand_and_arm.py \
+    --arm=G1_29 --ee=dex3 \
+    --input-mode=hand \
+    --retarget-type=dexpilot \
+    --record \
+    --task-dir=../../xr_recordings \
+    --task-name="pick_apple" \
+    --task-goal="pick up the apple" \
+    --motion
+
+## Hand Tracking + Vector (Psi0 风格 retargeting):
+python teleop_hand_and_arm.py \
+    --arm=G1_29 --ee=dex3 \
+    --input-mode=hand \
+    --retarget-type=vector \
+    --record \
+    --task-dir=../../xr_recordings \
+    --task-name="pick_apple" \
+    --task-goal="pick up the apple" \
+    --motion
+
+# =====================
+# 关键参数说明
+# =====================
+
+# --input-mode=controller  扳机线性插值控制手指开合
+# --input-mode=hand        VR 手部追踪，配合 --retarget-type 选择算法
+# --retarget-type=dexpilot 6对向量差分优化 (xr_teleoperate 原版)
+# --retarget-type=vector   3指尖位置优化 (Psi0 风格，更简单快速)
+# --motion                 允许行走 (摇杆控制)
+# --record                 启用录制功能 (VR 中按 A 键切换)
+# --ipc                    启用 ZMQ IPC (Gradio 面板自动加)
+
+# =====================
+# 常用排查
+# =====================
+
+# 视频流全黑:
+#   → PC2 的 teleimager-server 没启动，SSH 过去重启
+
+# 手臂失控:
+#   → 确认 robot_arm.py 中只对腰部施加重力补偿 tau，手臂 tau=0
+
+# 右手不动:
+#   → 检查日志 [Hand DBG] R_state 是否有异常值 (如 -238)
+#   → 如有，断电重启机器人清除编码器故障
+#   → 确认用的是 threading.Thread 而非 multiprocessing.Process
+
+# DDS 无通信:
+#   → 确认网络接口名: ip link show (通常是 enp2s0)
+#   → ChannelFactoryInitialize(0, "enp2s0")
+
+# 查看实时日志:
+tail -f /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group/teleop_latest.log
