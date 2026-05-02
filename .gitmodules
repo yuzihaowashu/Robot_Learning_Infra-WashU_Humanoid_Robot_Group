@@ -4,3 +4,6 @@
 [submodule "xr_teleoperate"]
 	path = xr_teleoperate
 	url = https://github.com/yuzihaowashu/xr_teleoperate.git
+[submodule "Psi0"]
+	path = Psi0
+	url = https://github.com/yuzihaowashu/Psi0.git

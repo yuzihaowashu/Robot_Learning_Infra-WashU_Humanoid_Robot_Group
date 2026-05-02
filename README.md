@@ -4,6 +4,7 @@ This branch is a trimmed runtime workspace for two workflows on the Unitree G1:
 
 - PICO 4 Ultra XR teleoperation for demonstration collection.
 - NVIDIA GR00T N1.6 VLA inference on the robot.
+- Psi0 VLA inference experiments as an optional backend.
 
 It intentionally removes older training, dashboard, drag-and-teach, and alternate teleoperation stacks so the repository is easier to deploy on the robot workstation.
 
@@ -31,6 +32,7 @@ git submodule update --init --recursive
 Submodules are pinned to WashU forks:
 
 - `Isaac-GR00T` -> `https://github.com/yuzihaowashu/Isaac-GR00T.git`
+- `Psi0` -> `https://github.com/yuzihaowashu/Psi0.git`
 - `xr_teleoperate` -> `https://github.com/yuzihaowashu/xr_teleoperate.git`
 - `xr_teleoperate/teleop/televuer` -> `https://github.com/yuzihaowashu/televuer.git`
 
@@ -42,6 +44,7 @@ Submodules are pinned to WashU forks:
 ├── run_xr_session.sh               # Recommended XR teleop launcher
 ├── run_xr_teleop.sh                # Direct XR teleop launcher
 ├── run_vla.sh                      # GR00T VLA inference launcher
+├── run_psi0.sh                     # Psi0 inference helper
 ├── docs/
 │   ├── teleoperation_commands.txt  # Bilingual quick commands
 │   ├── teleoperation.md            # Teleoperation details
@@ -54,6 +57,7 @@ Submodules are pinned to WashU forks:
 │   ├── robot_camera_server.py      # Camera helper deployed to robot PC
 │   └── vla_client.py               # GR00T policy client + G1 control bridge
 ├── Isaac-GR00T/                    # Submodule: GR00T inference server
+├── Psi0/                           # Submodule: optional Psi0 backend
 └── xr_teleoperate/                 # Submodule: PICO/WebXR teleop stack
 ```
 
@@ -129,6 +133,26 @@ Isaac-GR00T/.venv/bin/python
 ```
 
 See `docs/vla_inference.md` for details.
+
+## Psi0 Experiments
+
+Psi0 is kept as an optional VLA backend for comparison with GR00T. The helper script is intentionally conservative and does not directly command the robot until the Psi0 action format is verified against the G1 safety wrapper.
+
+```bash
+# Print Psi0 environment setup commands
+bash run_psi0.sh setup
+
+# Start generic Psi0 serving, after setting up Psi0/.venv-psi
+bash run_psi0.sh server /path/to/run 100000
+
+# Start Psi0 real-world RTC inference entry point
+bash run_psi0.sh rtc --task "g1/Pick_bottle_and_turn_and_pour_into_cup"
+
+# Safety placeholder; does not control the robot
+bash run_psi0.sh client --dry-run
+```
+
+Before enabling closed-loop robot control, compare Psi0's output action space with `utils/vla_client.py` and reuse the same G1 limits, delta clamps, balance assumptions, and stop behavior.
 
 ## Safety Notes
 
