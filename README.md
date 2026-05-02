@@ -1,242 +1,160 @@
-# WashU Humanoid Robot Group — Unitree G1 Infrastructure
+# WashU G1 Teleoperation and VLA Inference
 
-Control the Unitree G1 humanoid robot's dual arms, Dex3-1 dexterous hands,
-and run Vision-Language-Action (VLA) inference via NVIDIA GR00T N1.6.
+This branch is a trimmed runtime workspace for two workflows on the Unitree G1:
 
-## Features
+- PICO 4 Ultra XR teleoperation for demonstration collection.
+- NVIDIA GR00T N1.6 VLA inference on the robot.
 
-| Feature | Entry Point | Docs |
-|---------|-------------|------|
-| **VLA Inference** — GR00T N1.6 zero-shot control | `bash run_vla.sh` | [docs/vla_inference.md](docs/vla_inference.md) |
-| **Data Collection** — Record LeRobot datasets from demos | `bash run_collect.sh` | [docs/data_collection.md](docs/data_collection.md) |
-| **Drag-and-Teach** — Record & replay arm trajectories | `bash run_teach.sh` | [docs/teach_and_replay.md](docs/teach_and_replay.md) |
-| **VR Teleoperation** — PICO 4 Ultra VR → upper body control | `bash run_teleop.sh` | [docs/teleoperation.md](docs/teleoperation.md) |
-| **Dashboard** — Real-time GUI with camera, joints, tactile | `bash run_dashboard.sh` | [docs/dashboard.md](docs/dashboard.md) |
-| **Tactile Sensors** — Dex3 pressure sensor visualization | Integrated in dashboard | [docs/tactile_sensors.md](docs/tactile_sensors.md) |
-| **Setup & Arm Control** — Low-level SDK, joint maps, limits | — | [docs/setup_and_arm_control.md](docs/setup_and_arm_control.md) |
+It intentionally removes older training, dashboard, drag-and-teach, and alternate teleoperation stacks so the repository is easier to deploy on the robot workstation.
 
-## Quick Start
+## Branch Layout
 
-### Prerequisites
+The GitHub default branch is `teleop_vla_infer`.
 
-- Conda environment `lerobot` (Python 3.12) with Unitree SDK2, Pinocchio
-- GR00T `uv` venv (Python 3.10) at `Isaac-GR00T/.venv` (for VLA only)
-- Robot powered on and connected (IP: `192.168.123.164`)
+The previous development branch is preserved as `initial_dev`. The old `main` branch is also kept on GitHub for safety, but this branch is the recommended entry point.
 
-### 1. VLA Inference (GR00T N1.6)
+## Clone
+
+Clone with submodules:
 
 ```bash
-# Terminal 1: Start GPU inference server (loads model, ~30s)
+git clone --recurse-submodules https://github.com/yuzihaowashu/Robot_Learning_Infra-WashU_Humanoid_Robot_Group.git
+cd Robot_Learning_Infra-WashU_Humanoid_Robot_Group
+```
+
+If you already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+Submodules are pinned to WashU forks:
+
+- `Isaac-GR00T` -> `https://github.com/yuzihaowashu/Isaac-GR00T.git`
+- `xr_teleoperate` -> `https://github.com/yuzihaowashu/xr_teleoperate.git`
+- `xr_teleoperate/teleop/televuer` -> `https://github.com/yuzihaowashu/televuer.git`
+
+## Repository Contents
+
+```text
+.
+├── gradio_panel.py                 # Teleop control panel
+├── run_xr_session.sh               # Recommended XR teleop launcher
+├── run_xr_teleop.sh                # Direct XR teleop launcher
+├── run_vla.sh                      # GR00T VLA inference launcher
+├── docs/
+│   ├── teleoperation_commands.txt  # Bilingual quick commands
+│   ├── teleoperation.md            # Teleoperation details
+│   ├── gradio_panel.md             # Gradio panel notes
+│   ├── xr_teleoperate.md           # XR teleop details
+│   └── vla_inference.md            # VLA inference details
+├── utils/
+│   ├── arm_idle_holder.py          # Safe arm-spread holder daemon
+│   ├── g1-arm-holder.service       # systemd unit for arm holder
+│   ├── robot_camera_server.py      # Camera helper deployed to robot PC
+│   └── vla_client.py               # GR00T policy client + G1 control bridge
+├── Isaac-GR00T/                    # Submodule: GR00T inference server
+└── xr_teleoperate/                 # Submodule: PICO/WebXR teleop stack
+```
+
+## Robot Stand-Up Commands
+
+Before teleoperation or VLA control, make the G1 stand up with the Unitree remote controller:
+
+```text
+1. L2 + Y, then L2 + B
+   Press and hold L2 until the remote vibrates, press the button once, then release L2 quickly.
+
+2. L2 + UP
+   Joints move to the home / stand-ready position slowly.
+
+3. R1 + X
+   Activate the balance controller; the robot stands up.
+```
+
+If `g1-arm-holder.service` is active, `L2 + UP` may ramp the arms to the outward safety pose instead of the factory/default arm pose. This is intentional for Dex3 hand collision avoidance.
+
+## XR Teleoperation
+
+Recommended launcher:
+
+```bash
+bash run_xr_session.sh
+```
+
+The script checks the PC WiFi IP, certificate paths, PC2 camera reachability, and existing XR services. It prints the URL to open in the PICO browser:
+
+```text
+https://<PC_WiFi_IP>:8012/?ws=wss://<PC_WiFi_IP>:8012
+```
+
+Typical workflow:
+
+1. Start PC2 camera stream if needed:
+
+   ```bash
+   ssh unitree@192.168.123.164
+   conda activate teleimager && teleimager-server
+   ```
+
+2. Run `bash run_xr_session.sh` on the host PC.
+3. Click `(1) Launch Teleop` in Gradio.
+4. Open the PICO URL and click `Enter VR`.
+5. Use PICO controllers:
+   - `Left X`: start/resume tracking and begin a new episode.
+   - `Right A`: stop and save the current episode.
+   - `Right B`: manual recording toggle backup.
+   - Both joysticks pressed: emergency damping.
+6. Finish with `(2) Stop Teleop + Relax Arms`.
+7. Use `(3) Relax Arms to Default Pose` only as recovery if automatic relax did not finish.
+
+See `docs/teleoperation_commands.txt` for the bilingual quick reference.
+
+## VLA Inference
+
+GR00T inference uses two terminals:
+
+```bash
+# Terminal 1: GPU policy server
 bash run_vla.sh server
 
-# Terminal 2: Start robot client (step-by-step approval by default)
-bash run_vla.sh client --task "pick up the apple and place on plate"
+# Terminal 2: robot client, step-by-step by default
+bash run_vla.sh client --task "shake the bottle"
 ```
 
-Step-by-step mode shows each action's target angles in degrees and waits
-for your approval before execution. See [VLA docs](docs/vla_inference.md).
+`run_vla.sh` includes the robot stand-up commands at the top of the file. The script expects the GR00T environment at:
 
-### 2. Drag-and-Teach + Data Collection
+```text
+Isaac-GR00T/.venv/bin/python
+```
+
+See `docs/vla_inference.md` for details.
+
+## Safety Notes
+
+- Gradio always launches teleop with Unitree balance / `arm_sdk` mode enabled.
+- Walking commands are off by default and only enabled through the advanced manual control.
+- Teleop stop first parks arms at a safe outward pose, then relaxes toward the default/down pose.
+- The `arm_idle_holder.py` daemon can hold arms in the outward safety pose between sessions.
+- Use `EMERGENCY STOP` in Gradio if the robot behaves unexpectedly.
+
+## Useful Commands
+
+Check submodules:
 
 ```bash
-# Step 1: Record trajectories by physically moving the arms
-bash run_teach.sh record
-
-# Step 2: Collect LeRobot dataset by replaying trajectories
-bash run_collect.sh --task "pick up the apple" trajectories/traj_*.json
-
-# Step 3: Visualize the dataset locally
-python -m lerobot.scripts.lerobot_dataset_viz \
-    --repo-id yuzihaowashu/g1_pick_apple --root ./datasets/...
+git submodule status --recursive
 ```
 
-See [Teach & Replay docs](docs/teach_and_replay.md) and
-[Data Collection docs](docs/data_collection.md).
-
-### 3. VR Teleoperation (PICO 4 Ultra)
-
-Record demonstrations by teleoperating the robot's upper body with a VR
-headset.  Uses [TWIST2](https://github.com/amazon-far/TWIST2) for PICO VR
-reading and motion retargeting, connected to our control pipeline via Redis.
+Update submodules after pulling:
 
 ```bash
-# Quick test without any hardware
-bash run_teleop.sh mock record
-
-# Live teleoperation (requires PICO + Redis + robot)
-# Terminal 1: Start PICO PC Service app
-# Terminal 2: Start TWIST2 teleop
-conda activate gmr && cd TWIST2 && bash teleop.sh
-# Terminal 3: Start bridge + record
-bash run_teleop.sh record
+git submodule update --init --recursive
 ```
 
-Recorded trajectories are in the same JSON format as drag-and-teach, so
-the downstream `collect_dataset.py` → LeRobot → GR00T pipeline works with
-zero changes.  See [Teleoperation docs](docs/teleoperation.md) for full
-setup and design details.
-
-### 4. Dashboard
+Log out of GitHub on a shared robot PC:
 
 ```bash
-# Launch with auto camera setup
-bash run_dashboard.sh
-```
-
-See [Dashboard docs](docs/dashboard.md).
-
-## Robot Controller Sequence
-
-Before any arm control, the robot must be standing with the balance controller active:
-
-```
-Remote Controller:
-  (1) L2 + Y  and  L2 + B    — Power on
-  (2) L2 + UP                 — Joints to home position
-  (3) R1 + X                  — Activate balance controller (robot stands)
-
-After usage:
-  (1) L2 + UP                 — Home position (no controller)
-  (2) L2 + B                  — Power off (MUST BE HANGED!)
-```
-
-## Project Structure
-
-```
-.
-├── run_vla.sh                    # VLA inference (server + client)
-├── run_collect.sh                # Data collection (replay → LeRobot)
-├── run_teach.sh                  # Drag-and-teach (record + replay)
-├── run_teleop.sh                 # VR teleoperation bridge
-├── run_dashboard.sh              # GUI dashboard + camera
-├── trajectories/                 # Saved trajectory JSON files
-├── datasets/                     # LeRobot v2 datasets
-├── Isaac-GR00T/                  # [submodule] NVIDIA GR00T N1.6
-├── lerobot/                      # [submodule] HuggingFace LeRobot
-├── TWIST2/                       # [submodule] PICO VR teleop + GMR
-├── docs/
-│   ├── vla_inference.md          # VLA pipeline details
-│   ├── data_collection.md        # Dataset collection from demos
-│   ├── teach_and_replay.md       # Drag-and-teach details
-│   ├── teleoperation.md          # VR teleoperation design & setup
-│   ├── dashboard.md              # Dashboard GUI details
-│   ├── tactile_sensors.md        # Dex3 tactile sensor details
-│   └── setup_and_arm_control.md  # Low-level SDK and joint reference
-├── utils/
-│   ├── vla_client.py             # GR00T ↔ G1 bridge (DDS + ZMQ)
-│   ├── collect_dataset.py        # LeRobot dataset collection
-│   ├── teleop_bridge.py          # TWIST2 Redis → G1 DDS bridge
-│   ├── dashboard.py              # Tkinter GUI (joints, camera, tactile)
-│   ├── teach.py                  # Drag-and-teach recorder
-│   ├── replay.py                 # Trajectory replay with gravity comp.
-│   ├── robot_camera_server.py    # Camera server (deployed to robot)
-│   ├── test_tactile.py           # Raw tactile sensor debugging
-│   ├── arm_demo.py               # Choreographed arm motion sequences
-│   ├── visualize_workspace.py    # Arm workspace envelope (URDF)
-│   ├── test_arm_control.py       # Basic arm control test
-│   ├── start_camera.sh           # Manual camera start
-│   └── stop_camera.sh            # Manual camera stop
-└── tests/
-    └── test_teleop_bridge.py     # Teleop bridge unit tests (49 tests)
-```
-
-## Architecture
-
-```
-                        ┌─────────────────────────────────┐
-                        │    Host PC (RTX 4080, 16GB)     │
-                        │                                 │
-  ┌─────────────┐       │  ┌───────────┐   ┌───────────┐ │
-  │ GR00T N1.6  │◄─ZMQ──┤  │VLA Client │   │ Dashboard │ │
-  │ PolicyServer│──────►─┤  │(vla_client│   │(dashboard │ │
-  │  (GPU)      │       │  │   .py)    │   │   .py)    │ │
-  └─────────────┘       │  └─────┬─────┘   └─────┬─────┘ │
-                        │        │                │       │
-                        │   DDS  │           DDS  │       │
-  ┌─────────────┐       │        │                │       │
-  │ PICO 4 Ultra│       │  ┌─────┴─────────────┐  │       │
-  │ VR Headset  │       │  │  teleop_bridge.py  ◄─Redis   │
-  │ + TWIST2    │──Redis──►│  (VR → upper body) │  │       │
-  │ (gmr env)   │       │  └─────┬──────────────┘  │       │
-  └─────────────┘       │        │                 │       │
-                        │   DDS  │                 │       │
-                        └────────┼─────────────────┼───────┘
-                                 │                 │
-                        ┌────────▼─────────────────▼───────┐
-                        │         Unitree G1 Robot         │
-                        │  rt/arm_sdk ← arm commands       │
-                        │  rt/lowstate → joint feedback    │
-                        │  rt/dex3/*/cmd ← hand commands   │
-                        │  rt/dex3/*/state → tactile data  │
-                        │  ZMQ:5555 → camera stream        │
-                        └──────────────────────────────────┘
-```
-
-## Data Collection Workflows
-
-Two paths to create training datasets, both producing the same LeRobot v2
-format:
-
-```
-Path A: Drag-and-Teach                 Path B: VR Teleoperation
-┌─────────────────────┐                ┌─────────────────────┐
-│ Physically move arms │                │ Move VR controllers  │
-│ teach.py → JSON      │                │ TWIST2 → Redis →     │
-│                      │                │ teleop_bridge.py →   │
-│                      │                │ JSON                 │
-└──────────┬──────────┘                └──────────┬──────────┘
-           │                                      │
-           │    same JSON format                   │
-           ▼                                      ▼
-    ┌──────────────────────────────────────────────────┐
-    │ collect_dataset.py                               │
-    │ replay trajectory + record camera → LeRobot v2   │
-    └──────────────────────┬───────────────────────────┘
-                           │
-                           ▼
-                 ┌──────────────────┐
-                 │ LeRobot v2 Dataset│
-                 │ (Parquet + MP4)  │
-                 └────────┬─────────┘
-                          │
-                          ▼
-                 ┌──────────────────┐
-                 │ GR00T Training /  │
-                 │ VLA Fine-tuning   │
-                 └──────────────────┘
-```
-
-## Environment
-
-| Component | Version / Path |
-|-----------|---------------|
-| Conda env (main) | `lerobot` (Python 3.12) |
-| Conda env (TWIST2) | `gmr` (Python 3.10) |
-| GR00T venv | `Isaac-GR00T/.venv` (Python 3.10, uv) |
-| Unitree SDK2 | `/home/humanoid-pc/unitree_sdk2_python` |
-| URDF | `/home/humanoid-pc/unitree_rl_gym/resources/robots/g1_description/` |
-| GPU | NVIDIA RTX 4080 (16GB), CUDA 12.6, flash-attn 2.7.4 |
-| Robot SSH | `unitree@192.168.123.164` |
-| Redis | localhost:6379 (for VR teleoperation) |
-
-## Cloning This Repo
-
-```bash
-git clone --recurse-submodules https://github.com/yuzihaowashu/WashU_Humanoid_Robot_Group_Infrastructure.git
-cd WashU_Humanoid_Robot_Group_Infrastructure
-
-# If already cloned without submodules:
-git submodule update --init
-```
-
-This pulls three submodules:
-- `Isaac-GR00T/` — NVIDIA GR00T N1.6
-- `lerobot/` — HuggingFace LeRobot
-- `TWIST2/` — PICO VR teleoperation + GMR retargeting
-
-## Running Tests
-
-```bash
-# Teleop bridge tests (no hardware needed)
-python -m pytest tests/test_teleop_bridge.py -v
+gh auth logout
+gh auth status
 ```
