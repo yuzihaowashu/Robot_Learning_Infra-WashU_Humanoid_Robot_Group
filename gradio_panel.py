@@ -26,14 +26,34 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 XR_DIR = os.path.join(ROOT_DIR, "xr_teleoperate", "teleop")
 RECORDINGS_DIR = os.path.join(ROOT_DIR, "xr_recordings")
 TELEOP_LOG = os.path.join(ROOT_DIR, "teleop_latest.log")
+ROBOT_PC2_IP = "192.168.123.164"
+ROBOT_SUBNET_PREFIX = "192.168.123."
+PICO_VR_PORT = 8012
+GRADIO_PORT = 7860
+TELEIMAGER_CONFIG_PORT = 60000
+TELEIMAGER_HEAD_ZMQ_PORT = 55555
 
 sys.path.insert(0, os.path.join(ROOT_DIR, "xr_teleoperate"))
 
 
 def _get_local_ips():
-    """Return list of non-loopback IPv4 addresses."""
+    """Return non-loopback IPv4 addresses, preferring live interface data."""
     import socket
     ips = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            text=True,
+            timeout=2,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                ip = parts[parts.index("inet") + 1].split("/", 1)[0]
+                if not ip.startswith("127."):
+                    ips.append(ip)
+    except Exception:
+        pass
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
@@ -52,7 +72,192 @@ def _get_local_ips():
     return list(dict.fromkeys(ips))
 
 
-LOCAL_IPS = _get_local_ips()
+def _preferred_pico_ip():
+    """Choose the IP PICO should use; avoid the robot-only 192.168.123.x subnet."""
+    ips = _get_local_ips()
+    for ip in ips:
+        if not ip.startswith(ROBOT_SUBNET_PREFIX):
+            return ip
+    return ips[0] if ips else "<PC-WiFi-IP>"
+
+
+def _pico_vr_url(ip=None):
+    ip = ip or _preferred_pico_ip()
+    return f"https://{ip}:{PICO_VR_PORT}/?ws=wss://{ip}:{PICO_VR_PORT}"
+
+
+def _gradio_url(ip=None):
+    ip = ip or _preferred_pico_ip()
+    return f"http://{ip}:{GRADIO_PORT}"
+
+
+def _resolve_xr_cert_paths():
+    env_cert = os.getenv("XR_TELEOP_CERT")
+    env_key = os.getenv("XR_TELEOP_KEY")
+    if env_cert and env_key:
+        return env_cert, env_key
+    user_conf = os.path.join(os.path.expanduser("~"), ".config", "xr_teleoperate")
+    user_cert = os.path.join(user_conf, "cert.pem")
+    user_key = os.path.join(user_conf, "key.pem")
+    if os.path.exists(user_cert) and os.path.exists(user_key):
+        return user_cert, user_key
+    module_dir = os.path.join(XR_DIR, "televuer")
+    return os.path.join(module_dir, "cert.pem"), os.path.join(module_dir, "key.pem")
+
+
+def _cert_matches_ip(cert_path, ip):
+    if not os.path.exists(cert_path) or ip.startswith("<"):
+        return False
+    try:
+        out = subprocess.check_output(
+            ["openssl", "x509", "-in", cert_path, "-noout", "-text"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return f"IP Address:{ip}" in out or f"IP:{ip}" in out
+    except Exception:
+        return False
+
+
+def _port_open(host, port, timeout=0.25):
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _existing_service_pids():
+    """Return known XR service PIDs except this process."""
+    current_pid = os.getpid()
+    pids = []
+    for pattern in ("gradio_panel.py", "teleop_hand_and_arm.py"):
+        try:
+            out = subprocess.check_output(["pgrep", "-f", pattern], text=True).strip()
+        except subprocess.CalledProcessError:
+            continue
+        for pid_str in out.splitlines():
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            if pid != current_pid and pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def _confirm_kill_existing_services():
+    pids = _existing_service_pids()
+    port_busy = _port_open("127.0.0.1", GRADIO_PORT)
+    if not pids and not port_busy:
+        return
+
+    print("\nExisting XR service detected.")
+    if pids:
+        print("Known XR service processes:")
+        for pid in pids:
+            try:
+                cmd = subprocess.check_output(
+                    ["ps", "-p", str(pid), "-o", "pid=,cmd="],
+                    text=True,
+                ).strip()
+                print(f"  {cmd}")
+            except Exception:
+                print(f"  {pid}")
+    if port_busy:
+        print(f"Port {GRADIO_PORT} is already in use.")
+
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "Cannot prompt in non-interactive mode. Stop the old service first "
+            "or start through run_xr_session.sh."
+        )
+
+    reply = input("Kill existing XR service before starting a new one? [y/N] ").strip().lower()
+    if reply not in ("y", "yes"):
+        raise SystemExit("Aborted. Existing service was left running.")
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(2)
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    print("Old XR service processes stopped.\n")
+
+
+def _ping_ok(ip):
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            capture_output=True, text=True, timeout=3,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _last_log_lines(n=12):
+    if not os.path.exists(TELEOP_LOG):
+        return "(no teleop log yet)"
+    try:
+        with open(TELEOP_LOG, "r", errors="replace") as f:
+            lines = f.readlines()[-n:]
+        return "".join(lines).strip() or "(teleop log is empty)"
+    except Exception as exc:
+        return f"(failed to read teleop log: {exc})"
+
+
+def connection_info_markdown():
+    ips = _get_local_ips()
+    pico_ip = _preferred_pico_ip()
+    cert_path, key_path = _resolve_xr_cert_paths()
+    cert_ok = os.path.exists(cert_path) and os.path.exists(key_path)
+    cert_ip_ok = cert_ok and _cert_matches_ip(cert_path, pico_ip)
+    pc2_ok = _ping_ok(ROBOT_PC2_IP)
+    teleimager_config_ok = _port_open(ROBOT_PC2_IP, TELEIMAGER_CONFIG_PORT)
+    teleimager_head_ok = _port_open(ROBOT_PC2_IP, TELEIMAGER_HEAD_ZMQ_PORT)
+    vr_running = _port_open("127.0.0.1", PICO_VR_PORT)
+
+    ip_text = ", ".join(ips) if ips else "no LAN IP detected"
+    if cert_ip_ok:
+        cert_text = "OK"
+    elif cert_ok:
+        cert_text = "PRESENT, but may not include current WiFi IP"
+    else:
+        cert_text = "MISSING"
+    pc2_text = "reachable" if pc2_ok else "unreachable"
+    if teleimager_config_ok and teleimager_head_ok:
+        teleimager_text = "running"
+    elif pc2_ok:
+        teleimager_text = "not listening; start teleimager-server on PC2"
+    else:
+        teleimager_text = "unknown; PC2 unreachable"
+    vr_text = "running" if vr_running else "not running yet (expected before Launch Teleop)"
+
+    return (
+        f"**PICO VR URL:** `{_pico_vr_url(pico_ip)}`\n\n"
+        f"**Gradio URL:** `{_gradio_url(pico_ip)}`\n\n"
+        f"- Detected PC IPs: `{ip_text}`\n"
+        f"- Recommended PICO IP: `{pico_ip}` (avoid `{ROBOT_SUBNET_PREFIX}x` unless PICO is on that subnet)\n"
+        f"- XR HTTPS certificate: **{cert_text}** (`{cert_path}`, `{key_path}`)\n"
+        f"- PC2 / teleimager host `{ROBOT_PC2_IP}`: **{pc2_text}**\n"
+        f"- PC2 teleimager ports `{TELEIMAGER_CONFIG_PORT}`/`{TELEIMAGER_HEAD_ZMQ_PORT}`: **{teleimager_text}**\n"
+        f"- TeleVuer port `{PICO_VR_PORT}`: **{vr_text}**\n\n"
+        "Open the PICO URL **after** Launch Teleop starts the TeleVuer server. "
+        "If PICO opens the page but cannot enter VR, regenerate/trust the HTTPS certificate for the current WiFi IP."
+    )
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -61,7 +266,17 @@ _teleop_proc: subprocess.Popen | None = None
 _teleop_log_fh = None
 _ipc_client = None
 _ipc_lock = threading.Lock()
-_current_task_name = "pick_apple"
+_current_task_name = "shake_bottle"
+_current_recordings_dir = RECORDINGS_DIR
+
+
+def _resolve_recordings_dir(path):
+    if not path or not str(path).strip():
+        path = RECORDINGS_DIR
+    path = os.path.expanduser(str(path).strip())
+    if not os.path.isabs(path):
+        path = os.path.abspath(os.path.join(ROOT_DIR, path))
+    return path
 
 
 def _get_ipc_client():
@@ -121,15 +336,19 @@ def _kill_stale_teleop():
 _kill_stale_teleop()
 
 
-def launch_teleop(task_name, task_goal, task_desc, task_steps, input_mode, motion):
-    global _teleop_proc, _teleop_log_fh, _current_task_name
+def launch_teleop(task_name, task_goal, task_desc, task_steps, save_dir,
+                  input_mode, mirror_vr):
+    global _teleop_proc, _teleop_log_fh, _current_task_name, _current_recordings_dir
     _current_task_name = task_name
+    _current_recordings_dir = _resolve_recordings_dir(save_dir)
+    pico_url = _pico_vr_url()
 
     if _teleop_proc is not None and _teleop_proc.poll() is None:
-        return "Teleop process is already running."
+        return f"Teleop process is already running.\nPICO VR URL: {pico_url}"
 
     _kill_stale_teleop()
     _destroy_ipc_client()
+    os.makedirs(_current_recordings_dir, exist_ok=True)
 
     cmd = [
         sys.executable, os.path.join(XR_DIR, "teleop_hand_and_arm.py"),
@@ -137,14 +356,23 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, input_mode, motio
         "--arm=G1_29", "--ee=dex3",
         f"--input-mode={input_mode}",
         "--record",
-        f"--task-dir={RECORDINGS_DIR}",
+        "--force-zmq-video",
+        f"--task-dir={_current_recordings_dir}",
         f"--task-name={task_name}",
         f"--task-goal={task_goal}",
         f"--task-desc={task_desc}",
         f"--task-steps={task_steps}",
     ]
-    if motion:
-        cmd.append("--motion")
+    # Always keep Unitree balance / arm_sdk mode active in the Gradio workflow.
+    # Disabling this is only for bench/debug CLI use and can make the robot unsafe.
+    cmd.append("--motion")
+    if mirror_vr:
+        cmd.append("--mirror-vr")
+    else:
+        cmd.append("--no-mirror-vr")
+    # Stop inside teleop parks arms at the safe outward pose first; the Gradio
+    # Stop button then runs Relax Arms to Default Pose after the process exits.
+    cmd.append("--park-arms-on-stop=spread")
 
     _teleop_log_fh = open(TELEOP_LOG, "w")
     _teleop_proc = subprocess.Popen(
@@ -156,35 +384,63 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, input_mode, motio
 
     for _ in range(40):
         time.sleep(0.25)
+        if _teleop_proc.poll() is not None:
+            return (
+                f"Teleop exited early with code {_teleop_proc.returncode}.\n"
+                f"Last log lines:\n{_last_log_lines()}"
+            )
         client = _get_ipc_client()
         if client and client.is_online():
-            return f"Teleop launched (PID {_teleop_proc.pid}). IPC connected."
-    return f"Teleop launched (PID {_teleop_proc.pid}), but IPC heartbeat not yet detected."
+            return (
+                f"Teleop launched (PID {_teleop_proc.pid}). IPC connected.\n"
+                f"Save dir: {_current_recordings_dir}\n"
+                "Balance mode: always ON\n"
+                f"PICO VR URL: {pico_url}"
+            )
+    return (
+        f"Teleop launched (PID {_teleop_proc.pid}), but IPC heartbeat not yet detected.\n"
+        f"Save dir: {_current_recordings_dir}\n"
+        "Balance mode: always ON\n"
+        f"PICO VR URL: {pico_url}\n"
+        "If PICO cannot enter VR, check the log and refresh Preflight."
+    )
 
 
 def stop_teleop():
     global _teleop_proc, _teleop_log_fh
+    messages = []
     client = _get_ipc_client()
-    if client and client.is_online():
+    proc = _teleop_proc
+    if proc is not None and proc.poll() is None and client and client.is_online():
         try:
             client.send_data("CMD_STOP")
+            messages.append("Sent stop command through IPC.")
         except Exception:
-            pass
-    # give the process time to run go_home (~6s) before killing
-    for _ in range(20):
-        time.sleep(0.5)
-        if _teleop_proc is None or _teleop_proc.poll() is not None:
+            messages.append("IPC stop command failed; falling back to process signal.")
+    elif proc is not None and proc.poll() is None:
+        messages.append("IPC offline; stopping teleop process directly.")
+    else:
+        messages.append("No running teleop process found; running relax/recovery only.")
+
+    # Give a healthy teleop process a short window to run its own safe stop.
+    for _ in range(12):
+        if proc is None or proc.poll() is not None:
             break
-    if _teleop_proc is not None and _teleop_proc.poll() is None:
+        time.sleep(0.5)
+
+    if proc is not None and proc.poll() is None:
         try:
-            _teleop_proc.send_signal(signal.SIGTERM)
+            proc.send_signal(signal.SIGTERM)
+            messages.append("Teleop did not exit in time; sent SIGTERM.")
         except Exception:
             pass
         try:
-            _teleop_proc.wait(timeout=8)
+            proc.wait(timeout=4)
         except Exception:
             try:
-                _teleop_proc.kill()
+                proc.kill()
+                proc.wait(timeout=2)
+                messages.append("Teleop required SIGKILL.")
             except Exception:
                 pass
     _teleop_proc = None
@@ -195,14 +451,22 @@ def stop_teleop():
             pass
         _teleop_log_fh = None
     _destroy_ipc_client()
-    return "Teleop stopped."
+    relax_result = reset_arms()
+    messages.append(relax_result)
+    return "\n".join(messages)
 
 
 def reset_arms():
-    """Spread arms outward, then slowly release. Skip if already relaxed."""
+    """Return arms to the factory/default stand pose and pause the holder."""
+    if _teleop_proc is not None and _teleop_proc.poll() is None:
+        return (
+            "[BLOCKED] Teleop is still running. Click Stop Teleop first, "
+            "wait until it exits, then use Relax Arms to Default Pose."
+        )
+
     try:
         result = subprocess.run(
-            ["python", "-c", "\n".join([
+            [sys.executable, "-c", "\n".join([
                 "import sys, time, numpy as np",
                 f"sys.path.insert(0, '{os.path.join(ROOT_DIR, 'xr_teleoperate')}')",
                 f"sys.path.insert(0, '{XR_DIR}')",
@@ -224,22 +488,27 @@ def reset_arms():
                 "        print('Arms already near rest. OK')",
                 "        sys.exit(0)",
                 "",
-                "# Arms are NOT relaxed — do the safe release sequence",
+                "# Arms are NOT relaxed — release from the current safe outward pose.",
+                "# This skips the forward-ish q=0 waypoint that can bring Dex3",
+                "# fingers close to the body before the robot relaxes down.",
                 "from teleop.robot_control.robot_arm import G1_29_ArmController",
                 "arm = G1_29_ArmController(motion_mode=True, safe_deploy=False)",
                 "",
-                "# Use go_home which now does: spread → q=0 → slow ramp down",
-                "arm.ctrl_dual_arm_go_home()",
+                "# keep_holder_yield=True prevents arm_idle_holder from pulling",
+                "# the arms back to the outward spread pose immediately.",
+                "arm.ctrl_dual_arm_go_home(lower_to_zero=True, keep_holder_yield=True, skip_spread=True, clearance_path=False, skip_zero_waypoint=True)",
+                "from teleop.robot_control.robot_hand_unitree import dex3_release_hands",
+                "dex3_release_hands(duration=1.0)",
                 "print('OK')",
             ])],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=35,
             cwd=XR_DIR,
         )
         if "OK" in result.stdout:
-            return "[OK] Arms relaxed safely."
+            return "[OK] Arms returned to default stand pose. arm_idle_holder is paused."
         return f"[ERROR] {result.stderr[:200] if result.stderr else 'Unknown error'}"
     except subprocess.TimeoutExpired:
-        return "[ERROR] Arm release timed out (20s)."
+        return "[ERROR] Arm release timed out (35s)."
     except Exception as e:
         return f"[ERROR] {e}"
 
@@ -325,7 +594,7 @@ def poll_status_and_episodes():
     else:
         lines = "(waiting for events...)"
 
-    episodes = refresh_episodes(_current_task_name)
+    episodes = refresh_episodes(_current_task_name, _current_recordings_dir)
     return status_html, episodes, lines
 
 
@@ -345,23 +614,17 @@ def _badge(text, color):
 # PC2 teleimager reachability
 # ---------------------------------------------------------------------------
 def check_pc2(ip="192.168.123.164"):
-    try:
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", "1", ip],
-            capture_output=True, text=True, timeout=3,
-        )
-        if result.returncode == 0:
-            return _badge(f"PC2 ({ip}) REACHABLE", "green")
-        return _badge(f"PC2 ({ip}) UNREACHABLE", "red")
-    except Exception:
-        return _badge(f"PC2 ({ip}) CHECK FAILED", "gray")
+    if _ping_ok(ip):
+        return _badge(f"PC2 ({ip}) REACHABLE", "green")
+    return _badge(f"PC2 ({ip}) UNREACHABLE", "red")
 
 
 # ---------------------------------------------------------------------------
 # Episode history
 # ---------------------------------------------------------------------------
-def load_episodes(task_name):
-    task_dir = os.path.join(RECORDINGS_DIR, task_name)
+def load_episodes(task_name, save_dir=None):
+    base_dir = _resolve_recordings_dir(save_dir)
+    task_dir = os.path.join(base_dir, task_name)
     if not os.path.isdir(task_dir):
         return []
     rows = []
@@ -383,17 +646,18 @@ def load_episodes(task_name):
     return rows
 
 
-def refresh_episodes(task_name):
-    rows = load_episodes(task_name)
+def refresh_episodes(task_name, save_dir=None):
+    rows = load_episodes(task_name, save_dir)
     if not rows:
         return [["(no episodes)", "", "", ""]]
     return rows
 
 
-def _update_task_name(name):
-    global _current_task_name
+def _update_task_context(name, save_dir):
+    global _current_task_name, _current_recordings_dir
     _current_task_name = name
-    return refresh_episodes(name)
+    _current_recordings_dir = _resolve_recordings_dir(save_dir)
+    return refresh_episodes(name, _current_recordings_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -435,12 +699,12 @@ def build_ui():
             gr.Markdown("## Step 1 — Configure Task", elem_classes=["step-title"])
             with gr.Row():
                 task_name = gr.Textbox(
-                    label="Task Name", value="pick_apple",
-                    placeholder="e.g. pick_apple", scale=1,
+                    label="Task Name", value="shake_bottle",
+                    placeholder="e.g. shake_bottle", scale=1,
                 )
                 task_goal = gr.Textbox(
                     label="Task Goal",
-                    value="Pick up the apple from the table.",
+                    value="Shake the bottle with proper arm.",
                     placeholder="Short goal description", scale=2,
                 )
             with gr.Row():
@@ -453,12 +717,19 @@ def build_ui():
                     placeholder="step1: ...; step2: ...;", lines=2, scale=2,
                 )
             with gr.Row():
+                save_dir = gr.Textbox(
+                    label="Save Path",
+                    value=RECORDINGS_DIR,
+                    placeholder="Directory for saved episodes, e.g. /home/.../xr_recordings",
+                    scale=3,
+                )
+            with gr.Row():
                 input_mode = gr.Radio(
-                    ["controller", "hand"], label="Input Mode",
+                    ["controller"], label="Input Mode",
                     value="controller", scale=1,
                 )
-                motion_flag = gr.Checkbox(
-                    label="Enable Locomotion (--motion)", value=True, scale=1,
+                mirror_flag = gr.Checkbox(
+                    label="Show PC VR Mirror", value=True, scale=1,
                 )
 
         # ==================================================================
@@ -470,48 +741,68 @@ def build_ui():
                 "**Before launching, make sure:**\n"
                 "1. Robot G1 is **standing up** (use remote controller)\n"
                 "2. PC2 teleimager is running: `ssh unitree@192.168.123.164` → `cd ~/teleimager` → `conda activate teleimager` → `teleimager-server`\n"
-                "3. PICO VR is on and connected by wire / to the same WiFi"
+                "3. PICO VR is on and connected to the same WiFi as this PC\n\n"
+                "**Stop behavior:** `(2) Stop Teleop + Relax Arms` first parks arms in the safe outward pose, "
+                "then releases them toward the default/down pose."
             )
+            preflight_md = gr.Markdown(value=connection_info_markdown())
             with gr.Row():
                 launch_btn = gr.Button(
-                    "Launch Teleop", variant="primary",
+                    "(1) Launch Teleop", variant="primary",
                     elem_classes=["launch-btn"], scale=2,
                 )
-                stop_btn = gr.Button("Stop Teleop", variant="stop", scale=1)
-                reset_btn = gr.Button("Relax Arms", variant="secondary", scale=1)
-                pc2_btn = gr.Button("Check PC2", scale=1)
+                stop_btn = gr.Button("(2) Stop Teleop + Relax Arms", variant="stop", scale=1)
+                refresh_btn = gr.Button("Refresh Preflight", scale=1)
 
-            launch_output = gr.Textbox(label="Output", interactive=False, lines=2)
-            pc2_html = gr.HTML(value="", label="PC2 Status")
+            launch_output = gr.Textbox(label="Output", interactive=False, lines=6)
 
             launch_btn.click(
                 fn=launch_teleop,
-                inputs=[task_name, task_goal, task_desc, task_steps, input_mode, motion_flag],
+                inputs=[
+                    task_name,
+                    task_goal,
+                    task_desc,
+                    task_steps,
+                    save_dir,
+                    input_mode,
+                    mirror_flag,
+                ],
                 outputs=launch_output,
             )
             stop_btn.click(fn=stop_teleop, outputs=launch_output)
-            reset_btn.click(fn=reset_arms, outputs=launch_output)
-            pc2_btn.click(fn=check_pc2, outputs=pc2_html)
+            refresh_btn.click(fn=connection_info_markdown, outputs=preflight_md)
+
+            with gr.Accordion("Recovery / advanced", open=False):
+                gr.Markdown(
+                    "Use this if automatic relax after Stop did not complete, or after recovery. "
+                    "It pauses arm_idle_holder, so confirm Dex3 hands are clear of the thighs. "
+                    "Stop Teleop must finish before this button will run."
+                )
+                reset_btn = gr.Button("(3) Relax Arms to Default Pose", variant="secondary")
+                reset_btn.click(fn=reset_arms, outputs=launch_output)
 
         # ==================================================================
-        # Step 3: Control and Record
+        # Step 3: Manual backup controls
         # ==================================================================
         with gr.Group():
-            gr.Markdown("## Step 3 — Control and Record", elem_classes=["step-title"])
+            gr.Markdown("## Step 3 — Manual Backup / Advanced Controls", elem_classes=["step-title"])
             gr.Markdown(
-                "**PICO VR:** Open browser → `https://192.168.0.89:8012` → Enter VR\n\n"
-                "**Workflow (repeat for each episode):**\n"
-                "1. Click **Start Tracking** → robot arms follow VR controllers\n"
-                "2. Click **Toggle Recording** → recording starts (status shows ● REC)\n"
+                f"**PICO VR:** Open the URL shown in Preflight / Launch output, normally `{_pico_vr_url()}` → Enter VR\n\n"
+                "**Normal workflow (repeat for each episode):**\n"
+                "1. Put on PICO and click **Enter VR**\n"
+                "2. Press **VR Left X** -> start/resume tracking and begin a new episode\n"
                 "3. Perform the task\n"
-                "4. Click **Toggle Recording** again → episode saved, arms return home\n"
-                "5. Repeat from step 2 for the next episode (no need to re-launch)\n\n"
-                "*Locomotion is OFF by default. Click Toggle Locomotion to enable walking.*"
+                "4. Press **VR Right A** -> stop and save the current episode\n"
+                "5. Wait for 'saved' notification, then press **VR Left X** for the next episode\n\n"
+                "*The PC buttons below are backups for debugging or if the PICO buttons are unavailable. "
+                "The PC VR Mirror window lets audiences observe the operator view. "
+                "Balance mode is always ON; walking commands are OFF until Toggle Locomotion is enabled.*"
             )
-            with gr.Row():
-                start_btn = gr.Button("Start Tracking (r)", variant="primary", scale=2)
-                rec_btn = gr.Button("Toggle Recording (s)", variant="secondary", scale=2)
-                loco_btn = gr.Button("Toggle Locomotion (m)", variant="secondary", scale=2)
+            with gr.Accordion("Manual backup buttons", open=False):
+                with gr.Row():
+                    start_btn = gr.Button("Start Tracking (r)", variant="primary", scale=2)
+                    rec_btn = gr.Button("Toggle Recording (s)", variant="secondary", scale=2)
+                    loco_btn = gr.Button("Toggle Locomotion (m)", variant="secondary", scale=2)
 
             estop_btn = gr.Button(
                 "EMERGENCY STOP (q)",
@@ -530,13 +821,26 @@ def build_ui():
                     gr.Markdown("### Episode History (auto-refreshes)")
                     episode_table = gr.Dataframe(
                         headers=["Episode", "Date", "Frames", "Goal"],
-                        value=refresh_episodes("pick_apple"),
+                        value=refresh_episodes("shake_bottle", RECORDINGS_DIR),
                         interactive=False,
                         wrap=True,
                     )
                     refresh_btn = gr.Button("Refresh Episodes")
-                    refresh_btn.click(fn=refresh_episodes, inputs=task_name, outputs=episode_table)
-                    task_name.change(fn=_update_task_name, inputs=task_name, outputs=episode_table)
+                    refresh_btn.click(
+                        fn=refresh_episodes,
+                        inputs=[task_name, save_dir],
+                        outputs=episode_table,
+                    )
+                    task_name.change(
+                        fn=_update_task_context,
+                        inputs=[task_name, save_dir],
+                        outputs=episode_table,
+                    )
+                    save_dir.change(
+                        fn=_update_task_context,
+                        inputs=[task_name, save_dir],
+                        outputs=episode_table,
+                    )
 
                 with gr.Column(scale=1):
                     gr.Markdown("### Event Log (live)")
@@ -554,14 +858,31 @@ def build_ui():
 
 
 def _atexit_cleanup():
-    try:
-        stop_teleop()
-    except Exception:
-        pass
+    # Ctrl+C / process exit should only clean up background processes. Do not
+    # run the UI Stop+Relax path here, because it intentionally closes fingers.
+    global _teleop_proc, _teleop_log_fh
+    if _teleop_proc is not None and _teleop_proc.poll() is None:
+        try:
+            _teleop_proc.send_signal(signal.SIGTERM)
+            _teleop_proc.wait(timeout=2)
+        except Exception:
+            try:
+                _teleop_proc.kill()
+            except Exception:
+                pass
+    _teleop_proc = None
+    if _teleop_log_fh is not None:
+        try:
+            _teleop_log_fh.close()
+        except Exception:
+            pass
+        _teleop_log_fh = None
+    _destroy_ipc_client()
     _kill_stale_teleop()
 
 
 if __name__ == "__main__":
+    _confirm_kill_existing_services()
     atexit.register(_atexit_cleanup)
     demo = build_ui()
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False)

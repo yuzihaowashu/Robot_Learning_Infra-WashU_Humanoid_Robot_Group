@@ -5,10 +5,26 @@
 # ##################################################################################################
 #
 # G1 VLA Inference — GR00T N1.6
-# First, on Remote Robot Controller, run:
-# (1) L2 + Y and L2 + B (press L2 until feel it shake; press button once and suddenly release L2)
-# (2) L2 + UP --> Joints move to home position slowly
-# (3) R1 + X  --> balance controller will be activated and the robot will stand up!
+#
+# Robot stand-up commands / 机器人站立启动步骤:
+# First, on the Unitree remote controller, make the robot stand up safely:
+# 先在 Unitree 遥控器上执行以下步骤，让机器人安全站立:
+# (1) L2 + Y, then L2 + B
+#     Press and hold L2 until the remote vibrates, press the button once, then release L2 quickly.
+#     按住 L2 直到遥控器震动，按一次对应按键，然后快速松开 L2。
+# (2) L2 + UP --> joints move to the home/stand-ready position slowly
+#     L2 + UP --> 关节会慢慢回到 home / 站立准备姿态
+#     NOTE: if g1-arm-holder.service is active, the arms will instead ramp
+#     to the outward spread safety pose to keep Dex3 hands away from thighs.
+#     注意: 如果 g1-arm-holder.service 正在运行，手臂会被拉到安全外展位，
+#     用来避免 Dex3 手指碰到大腿。
+#     Check: sudo systemctl status g1-arm-holder.service
+#     To see the factory/default arm pose temporarily:
+#       sudo systemctl stop g1-arm-holder.service
+#     Restart it before teleop/VLA if Dex3 hands may collide with the thighs:
+#       sudo systemctl start g1-arm-holder.service
+# (3) R1 + X  --> activate balance controller; the robot will stand up
+#     R1 + X  --> 启动平衡控制器，机器人正式站起来
 # 
 # After usage, turn off the balance controller by pressing: 
 # (1) L2 + UP --> Still balance position but no controller

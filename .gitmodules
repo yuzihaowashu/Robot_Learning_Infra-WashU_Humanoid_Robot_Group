@@ -1,15 +1,6 @@
-[submodule "lerobot"]
-	path = lerobot
-	url = https://github.com/huggingface/lerobot.git
 [submodule "Isaac-GR00T"]
 	path = Isaac-GR00T
 	url = https://github.com/NVIDIA/Isaac-GR00T.git
-[submodule "TWIST2"]
-	path = TWIST2
-	url = git@github.com:amazon-far/TWIST2.git
 [submodule "xr_teleoperate"]
 	path = xr_teleoperate
-	url = git@github.com:yuzihaowashu/xr_teleoperate.git
-[submodule "Psi0"]
-	path = Psi0
-	url = https://github.com/physical-superintelligence-lab/Psi0.git
+	url = https://github.com/yuzihaowashu/xr_teleoperate.git

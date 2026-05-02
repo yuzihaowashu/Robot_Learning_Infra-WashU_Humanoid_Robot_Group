@@ -60,11 +60,14 @@ Status is received via ZMQ PUB/SUB heartbeat (`ipc://@xr_teleoperate_hb.ipc`).
 | Task Description | Saved to `data.json → text.description`        | —                |
 | Task Steps       | Saved to `data.json → text.steps`              | —                |
 | Input Mode       | `controller` or `hand`                         | `controller`     |
-| Enable Locomotion (--motion) | Passes `--motion` to the teleop script | checked      |
+| Enable Locomotion (--motion) | Passes `--motion` to the teleop script | unchecked    |
+| Show PC VR Mirror | Opens an observer window on the PC monitor | checked      |
 
 Buttons:
 - **Launch Teleop** — starts `teleop_hand_and_arm.py` with the above settings.
 - **Stop Teleop** — sends `CMD_STOP` via IPC, then kills the process group.
+- **Refresh Preflight** — refreshes PICO URL, certificate, PC2, and port status.
+- **Recovery / advanced → Relax / Re-park Arms** — recovery-only arm re-park action.
 
 ### Right Column — Live Control
 
@@ -82,9 +85,11 @@ Displays a table of all recorded episodes for the current task, reading
 Frame count, Goal. Auto-refreshes when Task Name changes; also has a manual
 **Refresh Episodes** button.
 
-### Network (accordion)
+### Preflight
 
-- **Check PC2 Connectivity** — pings `192.168.123.164` (robot onboard PC2).
+The preflight block shows the PICO WebXR URL, detected PC IPs, XR certificate
+status, PC2 reachability, and whether TeleVuer port `8012` is currently
+listening.
 
 ---
 
@@ -109,6 +114,10 @@ When the teleop process runs **without** `--headless`, an OpenCV window
 titled **"VR Mirror"** appears on the PC, displaying the same camera feed
 and HUD overlay that the VR operator sees. This allows observers to watch
 the teleoperation session on the PC monitor.
+
+If the local OpenCV build has no GUI backend (common in headless Python
+environments), the mirror disables itself and logs a warning instead of
+crashing teleoperation.
 
 ---
 

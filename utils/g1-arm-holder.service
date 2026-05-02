@@ -1,0 +1,83 @@
+# /etc/systemd/system/g1-arm-holder.service
+# ----------------------------------------------------------------------
+# Unitree G1 — keep both arms spread outward whenever no teleop/RL stack
+# is running, to prevent the Dex3-1 hands from colliding with the body
+# (root cause of dead motors in todo_docs/dex3_hand_error.md).
+#
+# This is the "always on" PC-side override of `rt/arm_sdk` recommended by
+# Unitree as the only way to change the resting arm pose without a firmware
+# patch (the FixStand/Damping FSM hard-codes shoulder roll = 0).
+#
+# Install (one-time, on the PC named `humanoid-pc`):
+#
+#   sudo cp utils/g1-arm-holder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now g1-arm-holder.service
+#
+# Operating workflow:
+#
+#   * Reboot the robot, wait ~60 s for zero-torque init, then press L2+UP
+#     once on the remote so the robot is in Damping/StandUp.  This unit
+#     will already be publishing arm_sdk weight=1 with shoulder roll
+#     spread outward, so the arms ramp to the safe pose.
+#
+#   * BEFORE you start teleop / an RL policy, write your PID into
+#     /tmp/g1_arm_holder_yield.pid (the holder will stop publishing for as
+#     long as the PID is alive). Or just `sudo systemctl stop
+#     g1-arm-holder.service`.  The current `xr_teleoperate` ArmController
+#     can be configured to do that automatically — see
+#     teleop/robot_control/robot_arm.py (`keep_spread` / yield-flag).
+#
+#   * AFTER teleop exits, remove the yield flag (or restart the service)
+#     so the holder takes over again before the FSM lowers the arms.
+#
+# Logs:
+#   sudo journalctl -u g1-arm-holder.service -f
+# ----------------------------------------------------------------------
+
+[Unit]
+Description=Unitree G1 Dex3 arm idle holder (spread arms over rt/arm_sdk)
+Documentation=file:///home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group/utils/arm_idle_holder.py
+After=network-online.target
+Wants=network-online.target
+# Don't restart-loop for forever if something is hopelessly broken.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=humanoid-pc
+Group=humanoid-pc
+WorkingDirectory=/home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group
+
+# Wait long enough for the robot to finish its zero-torque init phase
+# (~60 s on G1) AND for the PC's Ethernet link to actually carry traffic.
+# If we publish too early, our LowCmd is rejected (mode_machine is 0).
+ExecStartPre=/bin/sleep 75
+
+# We use the lerobot conda env, which already has unitree_sdk2py installed.
+ExecStart=/home/humanoid-pc/miniconda3/envs/lerobot/bin/python -u \
+    /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group/utils/arm_idle_holder.py \
+    --iface enp2s0 --hz 50 --ramp-time 8.0
+
+# Environment knobs (override at install time if interface changes etc.)
+Environment=G1_IFACE=enp2s0
+Environment=PYTHONUNBUFFERED=1
+
+# Crash recovery — restart on failure but not on a clean exit.
+Restart=on-failure
+RestartSec=5
+
+# Graceful stop: SIGTERM only stops *publishing*, it does NOT release the
+# arm_sdk weight, so the arms stay spread until something else (teleop or
+# us, restarted) takes over. Keep TimeoutStopSec short.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=8
+
+# We're publishing real-time control commands at 50 Hz; bump scheduling
+# priority a bit so the host's other workloads don't starve us. Optional.
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

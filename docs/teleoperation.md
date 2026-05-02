@@ -394,7 +394,65 @@ robot remains push-resistant during teleoperation.
 With `--with-waist`, waist joints (12-14) are also controlled from VR,
 giving 17 DoF total.  Use this only if your task requires torso rotation.
 
-### 6. What We Do NOT Have (future work)
+### 6. Dex3 Collision Avoidance (`arm_idle_holder`)
+
+The G1's factory FSMs (Damping / FixStand / StandUp) park both shoulder
+rolls at ~0 rad, which presses the Dex3-1 finger tips against the robot's
+outer thighs.  Over time this has destroyed multiple finger motors
+(left thumb 0/1/2, right index 0/1 — see
+[`todo_docs/dex3_hand_error.md`](../todo_docs/dex3_hand_error.md)).
+The factory firmware does **not** expose the resting-pose angles, so the
+only fix is a PC-side `rt/arm_sdk` override that runs whenever no teleop
+or RL stack is.
+
+We ship that override as a tiny daemon in `utils/arm_idle_holder.py`,
+managed by systemd:
+
+```bash
+# one-time install on humanoid-pc
+sudo cp utils/g1-arm-holder.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now g1-arm-holder.service
+
+# day-to-day
+sudo systemctl status g1-arm-holder.service     # is it healthy?
+sudo journalctl -u g1-arm-holder.service -f     # live logs
+sudo systemctl stop  g1-arm-holder.service      # before unplugging the robot
+```
+
+Properties:
+
+- Continuously publishes a LowCmd to `rt/arm_sdk` at ~50 Hz with
+  `arm_sdk weight = 1.0`, `q[L_ShoulderRoll] = +1.5 rad`,
+  `q[R_ShoulderRoll] = -1.5 rad`, all other arm/waist joints at 0.
+  Result: arms stay outward, fingers cannot touch the body.
+- Gains (`kp_low=150`, `kp_wrist=60`, …) match those in
+  `xr_teleoperate/teleop/robot_control/robot_arm.py`, so when a teleop
+  process takes over the handoff is bumpless.
+- Honors a yield flag at `/tmp/g1_arm_holder_yield.pid`. The
+  `G1_29_ArmController` writes its PID into that file on init and removes
+  it on `ctrl_dual_arm_go_home`, so the holder yields automatically while
+  teleop runs. If a teleop process crashes without cleanup, the holder
+  notices the dead PID and resumes on its own.
+- On clean exit (SIGTERM from systemd) the holder simply **stops
+  publishing** without ramping `arm_sdk weight` to 0. The arms therefore
+  freeze at spread until something else drives `rt/arm_sdk` again.
+  (Ramping the weight to 0 would hand control back to the FSM, which
+  would immediately put the fingers back into the unsafe pose.)
+
+Companion controller-side change (already merged):
+[`xr_teleoperate/teleop/robot_control/robot_arm.py`](../xr_teleoperate/teleop/robot_control/robot_arm.py)
+now defaults `keep_spread=True`, which:
+
+- skips Phase 2 ("home q=0") in the constructor's `safe_arm_deploy`,
+- makes `ctrl_dual_arm_go_home()` stop after the spread step (no
+  q→0, no weight ramp).
+
+Pass `lower_to_zero=True` to `ctrl_dual_arm_go_home` *only* when you
+have confirmed the resulting pose is collision-free for the current
+hand hardware (e.g. after a Dex3 redesign).
+
+### 7. What We Do NOT Have (future work)
 
 - **Self-collision avoidance**: TWIST2's RL policy has self-collision
   penalties baked into training.  Since we bypass the RL policy, we don't
@@ -602,16 +660,63 @@ sudo ufw allow 5555/tcp    # ZMQ camera stream (if using ZED Mini)
 ### Startup Sequence (Checklist)
 
 ```
-□ 1. Power on the G1 robot
-□ 2. Connect Ethernet cable (PC ↔ robot), verify: ping 192.168.123.164
-□ 3. Ensure PC and PICO are on the same WiFi
-□ 4. Start xrobotoolkit-pc-service app on PC
-□ 5. On PICO: open XRobot app → enter PC WiFi IP → Connect → Start streaming
-□ 6. Terminal 1: conda activate gmr && cd TWIST2 && bash teleop.sh
+□ 1. Power on the G1 robot. Wait ~60 s for the zero-torque init phase
+     to finish (you should hear the cooling fans steady out).
+
+□ 2. Connect Ethernet cable (PC ↔ robot), verify:
+        ping 192.168.123.164    # Orin PC (SSH target)
+        ping 192.168.123.161    # motion controller (DDS target)
+
+□ 3. CRITICAL — sanity-check the arm before doing anything else:
+        python utils/check_motors.py
+     All 29 motors must report mode=1 / OK.  If any left- or right-arm
+     motor shows mode=0 (FAULT), it's almost always because someone
+     manually rotated a powered arm — DO NOT push or twist a powered
+     arm.  Recovery: remote L2+B → L2+R2 → L2+UP, or App calibration
+     (标定), or a power cycle.
+
+□ 4. Verify the Dex3 collision guard is running:
+        sudo systemctl status g1-arm-holder.service
+     ↳ status = "active (running)" and journal shows
+        "[arm_idle_holder] alive (hold) published=N yielded=0"
+     This service is what keeps both shoulders rolled outward so the
+     fingers cannot touch the thighs (see "Safety Measures → 6. Dex3
+     Collision Avoidance").  If it is NOT running:
+        sudo systemctl start g1-arm-holder.service
+        sleep 3 && python utils/check_motors.py     # arms should be at q≈±1.5
+
+□ 5. Press L2+UP on the remote so the robot is in StandUp/Damping.
+     Because the holder is overriding rt/arm_sdk, the arms move
+     immediately to the spread pose instead of into the body.
+
+□ 6. Ensure PC and PICO are on the same WiFi.
+
+□ 7. Start xrobotoolkit-pc-service app on PC.
+
+□ 8. On PICO: open XRobot app → enter PC WiFi IP → Connect → Start streaming.
+
+□ 9. Terminal 1: conda activate gmr && cd TWIST2 && bash teleop.sh
      (you should see the MuJoCo visualization window)
-□ 7. In MuJoCo window, press right controller A to start teleop
-□ 8. Terminal 2: bash run_teleop.sh          (or: bash run_teleop.sh record)
-□ 9. The robot arms should now follow your VR hand movements
+
+□ 10. In MuJoCo window, press right controller A to start teleop.
+
+□ 11. Terminal 2:
+         bash run_teleop.sh          # or: bash run_teleop.sh record
+      The G1_29_ArmController constructor automatically writes its PID
+      into /tmp/g1_arm_holder_yield.pid, so the holder yields and stops
+      fighting us.  The arms should now follow your VR hand movements.
+      Sanity check (in another terminal):
+         cat /tmp/g1_arm_holder_yield.pid           # should match teleop pid
+         sudo journalctl -u g1-arm-holder.service -n 5
+            → "YIELDING — another process is driving rt/arm_sdk"
+
+□ 12. Stopping teleop:
+        - Press X (left controller) for the in-script "go home" path:
+          ctrl_dual_arm_go_home() spreads the arms again, removes the
+          yield flag, and the holder takes over within one publish tick.
+        - OR Ctrl+C in Terminal 2.  Either way, do NOT power-off the
+          robot before you see the holder back in "hold" state, otherwise
+          the FSM may drop the arms into the body in the meantime.
 ```
 
 ### VR Controller Button Map
