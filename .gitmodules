@@ -1,6 +1,6 @@
 [submodule "Isaac-GR00T"]
 	path = Isaac-GR00T
-	url = https://github.com/NVIDIA/Isaac-GR00T.git
+	url = https://github.com/yuzihaowashu/Isaac-GR00T.git
 [submodule "xr_teleoperate"]
 	path = xr_teleoperate
 	url = https://github.com/yuzihaowashu/xr_teleoperate.git
