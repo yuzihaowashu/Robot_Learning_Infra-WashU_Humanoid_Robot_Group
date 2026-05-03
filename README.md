@@ -45,6 +45,7 @@ Submodules are pinned to WashU forks:
 ├── run_xr_teleop.sh                # Direct XR teleop launcher
 ├── run_vla.sh                      # GR00T VLA inference launcher
 ├── run_psi0.sh                     # Psi0 inference helper
+├── run_reset_arms.sh               # Stand/default arm reset helper
 ├── docs/
 │   ├── teleoperation_commands.txt  # Bilingual quick commands
 │   ├── teleoperation.md            # Teleoperation details
@@ -136,23 +137,35 @@ See `docs/vla_inference.md` for details.
 
 ## Psi0 Experiments
 
-Psi0 is kept as an optional VLA backend for comparison with GR00T. The helper script is intentionally conservative and does not directly command the robot until the Psi0 action format is verified against the G1 safety wrapper.
+Psi0 is kept as an optional VLA backend for comparison with GR00T. The recommended real-robot path is the `rtc-bimanual` client: it uses Psi0's upstream WebSocket RTC timing, executes only the bimanual arm/hand portion of the 36D action, ignores torso/base policy outputs, and keeps step-by-step approval by default.
 
 ```bash
 # Print Psi0 environment setup commands
 bash run_psi0.sh setup
 
-# Start generic Psi0 serving, after setting up Psi0/.venv-psi
-bash run_psi0.sh server /path/to/run 100000
+# Terminal 1: start the tested local Psi0 WebSocket RTC server.
+# Model files live outside git under /home/humanoid-pc/psi0_runtime.
+bash run_psi0.sh server-rtc /home/humanoid-pc/psi0_runtime/runs/psi0_baseline_release 0
 
-# Start Psi0 real-world RTC inference entry point
-bash run_psi0.sh rtc --task "g1/Pick_bottle_and_turn_and_pour_into_cup"
+# Terminal 2: run bimanual-only Psi0 RTC inference.
+bash run_psi0.sh rtc-bimanual --task "put the bottle into the paper box" --execute --send-hands
 
-# Safety placeholder; does not control the robot
-bash run_psi0.sh client --dry-run
+# Optional: hold each approved Enter step longer.
+bash run_psi0.sh rtc-bimanual --task "put the bottle into the paper box" --execute --send-hands --step-seconds 2.0
 ```
 
-Before enabling closed-loop robot control, compare Psi0's output action space with `utils/vla_client.py` and reuse the same G1 limits, delta clamps, balance assumptions, and stop behavior.
+The bimanual RTC client in `utils/psi0_rtc_bimanual_client.py` treats the Psi0 release actions as deltas, accumulates approved RTC steps, clamps G1 arm targets, and uses XR teleop's waist behavior (`--waist-mode xr-upright` by default) to keep the robot balanced while ignoring Psi0 torso/base outputs. It refuses to run with XR teleop still active unless `--allow-competing-control` is explicitly passed. The older HTTP safety client remains available as `bash run_psi0.sh client`, and the upstream raw RTC client is gated behind `bash run_psi0.sh rtc --raw-robot-control` for debugging only.
+
+On `q` or `Ctrl+C`, `rtc-bimanual` smoothly parks the arms at `--exit-pose default` by default. Use `--exit-pose spread` if Dex3 thigh clearance is preferred, or `--exit-pose hold` only for debugging.
+
+If a client exits unexpectedly and leaves the arms away from the stand pose, use the standalone recovery helper:
+
+```bash
+bash run_reset_arms.sh
+
+# Or move to the outward Dex3-safe spread pose.
+bash run_reset_arms.sh --pose spread
+```
 
 ## Safety Notes
 

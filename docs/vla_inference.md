@@ -160,6 +160,67 @@ Key dependencies:
 - `run_vla.sh` — Orchestration script (server, client, camera, test)
 - `Isaac-GR00T/` — NVIDIA GR00T repository (submodule)
 
+## Psi0 RTC Bimanual Backend
+
+Psi0 is available as a second VLA backend for zero-shot experiments. Use the
+WebSocket RTC path for real-robot tests because it preserves Psi0's original
+action timing while restricting execution to the G1 arms and Dex3 hands.
+
+```bash
+# Terminal 1: Psi0 WebSocket RTC server
+bash run_psi0.sh server-rtc /home/humanoid-pc/psi0_runtime/runs/psi0_baseline_release 0
+
+# Terminal 2: bimanual-only client, step-by-step by default
+bash run_psi0.sh rtc-bimanual --task "put the bottle into the paper box" --execute --send-hands
+```
+
+Controls match the GR00T step-by-step client:
+- **Enter** — approve the next chunk of RTC actions
+- **s** — skip this proposed action
+- **c** — switch to continuous execution
+- **q** — quit
+
+Important implementation details:
+- Psi0 outputs 36D whole-body actions. The local client uses `action[0:14]`
+  for hands, `action[14:28]` for arms, and ignores `action[28:36]`
+  torso/base commands.
+- The tested release checkpoint uses delta actions, so
+  `utils/psi0_rtc_bimanual_client.py` accumulates arm deltas before sending
+  targets to `rt/arm_sdk`.
+- Default waist handling is `--waist-mode xr-upright`, matching the working
+  XR teleop behavior: waist target is `[0, 0, 0]` with waist PD
+  `kp=200, kd=5`.
+- `--step-seconds` controls how long each approved Enter press consumes and
+  executes subsequent RTC actions. Increase it, for example to `2.0`, if each
+  approved step is too short.
+- The client aborts if `teleop_hand_and_arm.py` is still running, because XR
+  teleop would overwrite Psi0 arm commands. Stop teleop first, or pass
+  `--allow-competing-control` only for debugging.
+- `--test-arm-nudge` sends a tiny diagnostic arm command without Psi0. If this
+  does not move, the issue is the robot control mode or `arm_sdk`, not model
+  inference.
+- On `q` or `Ctrl+C`, the client stops receiving RTC actions and smoothly
+  returns the arms to `--exit-pose default`. Use `--exit-pose spread` for the
+  outward Dex3-safe pose, or `--exit-pose hold` only when debugging.
+
+### Stand/Default Arm Reset Helper
+
+If a VLA or teleop process exits unexpectedly and leaves the arms away from the
+stand pose, use the standalone reset helper. It does not require a Psi0 or
+GR00T server.
+
+```bash
+# Return both arms to the stand/default q=0 pose
+bash run_reset_arms.sh
+
+# Move both arms to the outward Dex3-safe spread pose
+bash run_reset_arms.sh --pose spread
+```
+
+The script refuses to run while teleop or VLA clients are still active, because
+two processes publishing arm commands will fight each other. Stop the active
+client first, or pass `--force` only for debugging.
+
 ## Pretrained Checkpoints
 
 | Checkpoint | Task | Notes |
