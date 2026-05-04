@@ -16,9 +16,11 @@ import cv2
 import numpy as np
 from datasets import Dataset, Features, Sequence, Value
 from huggingface_hub import create_repo, create_tag, upload_large_folder
+from huggingface_hub.errors import HfHubHTTPError
 
 
 CODE_VERSION = "xr-teleop-v1"
+DEFAULT_TACTILE_DIM = 216
 DEFAULT_TASKS = (
     "place_bottle_in_paper_box",
     "take_bottle_out_of_paper_box",
@@ -79,6 +81,23 @@ def build_action(frame: dict[str, Any]) -> list[float]:
         + get_qpos(frame, "actions", "right_ee")
         + get_qpos(frame, "actions", "body")
     )
+
+
+def flatten_tactile(frame: dict[str, Any], tactile_dim: int) -> list[float]:
+    tactiles = frame.get("tactiles") or {}
+    values: list[float] = []
+    if isinstance(tactiles, dict):
+        for name in ("left_ee", "right_ee"):
+            raw = tactiles.get(name) or []
+            values.extend(float(x) for x in raw)
+    elif isinstance(tactiles, list):
+        values.extend(float(x) for x in tactiles)
+
+    if tactile_dim <= 0:
+        return values
+    if len(values) < tactile_dim:
+        values.extend([0.0] * (tactile_dim - len(values)))
+    return values[:tactile_dim]
 
 
 def image_path(episode_dir: Path, frame: dict[str, Any], camera: str) -> Path:
@@ -176,14 +195,18 @@ def vector_stats(values: list[list[float]]) -> dict[str, Any]:
 
 
 class XrToLeRobotConverter:
-    def __init__(self, camera: str, fps: int, chunks_size: int):
+    def __init__(
+        self, camera: str, fps: int, chunks_size: int, tactile_dim: int
+    ):
         self.camera = camera
         self.fps = fps
         self.chunks_size = chunks_size
+        self.tactile_dim = tactile_dim
         self.features = Features(
             {
                 "states": Sequence(Value("float32")),
                 "action": Sequence(Value("float32")),
+                "observation.tactile": Sequence(Value("float32")),
                 "timestamp": Value("float32"),
                 "frame_index": Value("int64"),
                 "episode_index": Value("int64"),
@@ -198,6 +221,7 @@ class XrToLeRobotConverter:
         self.total_frames = 0
         self.state_dim: int | None = None
         self.action_dim: int | None = None
+        self.observation_tactile_dim: int | None = None
         self.image_shape: tuple[int, int, int] | None = None
 
     def convert_one(
@@ -222,6 +246,7 @@ class XrToLeRobotConverter:
 
         states: list[list[float]] = []
         actions: list[list[float]] = []
+        tactile_values: list[list[float]] = []
         rows: list[dict[str, Any]] = []
         image_paths: list[Path] = []
         global_start = dataset_cursor
@@ -229,10 +254,13 @@ class XrToLeRobotConverter:
         for frame_index, frame in enumerate(frames[:-1]):
             state = build_state(frame)
             action = build_action(frames[frame_index + 1])
+            tactile = flatten_tactile(frame, self.tactile_dim)
             if self.state_dim is None:
                 self.state_dim = len(state)
             if self.action_dim is None:
                 self.action_dim = len(action)
+            if self.observation_tactile_dim is None:
+                self.observation_tactile_dim = len(tactile)
             if len(state) != self.state_dim:
                 raise ValueError(
                     f"State dim changed in {episode_dir}: "
@@ -243,14 +271,21 @@ class XrToLeRobotConverter:
                     f"Action dim changed in {episode_dir}: "
                     f"{len(action)} != {self.action_dim}"
                 )
+            if len(tactile) != self.observation_tactile_dim:
+                raise ValueError(
+                    f"Tactile dim changed in {episode_dir}: "
+                    f"{len(tactile)} != {self.observation_tactile_dim}"
+                )
 
             states.append(state)
             actions.append(action)
+            tactile_values.append(tactile)
             image_paths.append(image_path(episode_dir, frame, self.camera))
             rows.append(
                 {
                     "states": state,
                     "action": action,
+                    "observation.tactile": tactile,
                     "timestamp": frame_index / float(self.fps),
                     "frame_index": frame_index,
                     "episode_index": episode_index,
@@ -298,6 +333,7 @@ class XrToLeRobotConverter:
                 "stats": {
                     "states": vector_stats(states),
                     "action": vector_stats(actions),
+                    "observation.tactile": vector_stats(tactile_values),
                 },
             }
         )
@@ -308,6 +344,7 @@ class XrToLeRobotConverter:
         if (
             self.state_dim is None
             or self.action_dim is None
+            or self.observation_tactile_dim is None
             or self.image_shape is None
         ):
             raise RuntimeError("No episodes converted")
@@ -337,6 +374,14 @@ class XrToLeRobotConverter:
                 "dtype": "float32",
                 "shape": [self.action_dim],
                 "names": [f"action_{i}" for i in range(self.action_dim)],
+            },
+            "observation.tactile": {
+                "dtype": "float32",
+                "shape": [self.observation_tactile_dim],
+                "names": [
+                    f"tactile_{i}"
+                    for i in range(self.observation_tactile_dim)
+                ],
             },
             "timestamp": {"dtype": "float32", "shape": [1]},
             "frame_index": {"dtype": "int64", "shape": [1]},
@@ -429,6 +474,7 @@ This dataset was converted from G1 XR teleoperation recordings.
 - Camera: egocentric `{self.camera}`
 - State dimension: {self.state_dim}
 - Action dimension: {self.action_dim}
+- Tactile dimension: {self.observation_tactile_dim}
 
 ## Tasks
 
@@ -467,17 +513,24 @@ def summarize_dataset(out_dir: Path) -> None:
         f"  state_dim={info['features']['states']['shape'][0]} "
         f"action_dim={info['features']['action']['shape'][0]}"
     )
+    print(
+        "  tactile_dim="
+        f"{info['features']['observation.tactile']['shape'][0]}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", type=Path, default=Path("xr_recordings"))
+    parser.add_argument(
+        "--data-root", type=Path, default=Path("xr_recordings")
+    )
     parser.add_argument(
         "--out-dir", type=Path, default=Path("xr_recordings_lerobot")
     )
     parser.add_argument("--tasks", type=str, default=",".join(DEFAULT_TASKS))
     parser.add_argument("--camera", type=str, default="color_0")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--tactile-dim", type=int, default=DEFAULT_TACTILE_DIM)
     parser.add_argument("--chunks-size", type=int, default=1000)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--push", action="store_true")
@@ -502,7 +555,9 @@ def main() -> None:
         shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    converter = XrToLeRobotConverter(args.camera, args.fps, args.chunks_size)
+    converter = XrToLeRobotConverter(
+        args.camera, args.fps, args.chunks_size, args.tactile_dim
+    )
     cursor = 0
     for episode_index, (
         task_index,
@@ -536,7 +591,11 @@ def main() -> None:
             repo_type="dataset",
             folder_path=str(args.out_dir),
         )
-        create_tag(args.repo_id, tag=CODE_VERSION, repo_type="dataset")
+        try:
+            create_tag(args.repo_id, tag=CODE_VERSION, repo_type="dataset")
+        except HfHubHTTPError as exc:
+            if "Tag reference exists already" not in str(exc):
+                raise
         print(f"Uploaded to https://huggingface.co/datasets/{args.repo_id}")
 
 
