@@ -2,6 +2,8 @@
 
 # Recorded trajectories (can be large)
 trajectories/*.json
+xr_recordings/
+xr_recordings_lerobot/
 
 # Python
 __pycache__/

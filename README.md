@@ -104,6 +104,9 @@ Typical workflow:
 
 2. Run `bash run_xr_session.sh` on the host PC.
 3. Click `(1) Launch Teleop` in Gradio.
+   - `Arm Mode = bimanual`: both arms follow XR.
+   - `Arm Mode = left-only`: left arm follows XR; right arm is held at the selected inactive pose and recorded with zero action.
+   - `Arm Mode = right-only`: right arm follows XR; left arm is held at the selected inactive pose and recorded with zero action.
 4. Open the PICO URL and click `Enter VR`.
 5. Use PICO controllers:
    - `Left X`: start/resume tracking and begin a new episode.

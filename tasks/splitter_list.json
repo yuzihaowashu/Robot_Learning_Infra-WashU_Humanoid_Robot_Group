@@ -1,0 +1,66 @@
+{
+  "default": "Off",
+  "splitters": [
+    {
+      "label": "Off",
+      "id": "off",
+      "enabled": false,
+      "delete_original_on_success": false,
+      "notes": "Do not split saved episodes automatically."
+    },
+    {
+      "label": "Bottle in/out continuous splitter",
+      "id": "bottle_in_out",
+      "enabled": true,
+      "delete_original_on_success": false,
+      "require_all_directions_before_delete": true,
+      "raw_task": {
+        "name": "bottle_in_out_raw",
+        "goal": "Record one long continuous bottle in/out episode for automatic splitting.",
+        "desc": "Continuous raw recording for repeated bottle in/out motions. This raw episode is the source file and should be kept after successful auto-splitting.",
+        "steps": "Repeat: place the bottle into the paper box, then take the bottle out from the paper box. Keep recording continuously without stopping between cycles."
+      },
+      "directions": {
+        "forward": {
+          "name": "place_bottle_in_paper_box",
+          "segment_type": "place_bottle_into_paper_box",
+          "description": "Bottle starts near the initial region, then is placed into the paper box.",
+          "start_condition": {
+            "near_initial_position": true,
+            "finger_transition": "open_to_close"
+          },
+          "end_condition": {
+            "finger_transition": "close_to_open"
+          }
+        },
+        "backward": {
+          "name": "take_bottle_out_of_paper_box",
+          "segment_type": "take_bottle_out_of_paper_box",
+          "description": "Bottle starts inside the paper box, then is taken out and returned near the start region.",
+          "start_condition": {
+            "near_initial_position": false,
+            "finger_transition": "open_to_close"
+          },
+          "end_condition": {
+            "robot_pose_near_initial_region": true,
+            "finger_transition": "close_to_open"
+          }
+        }
+      },
+      "config": {
+        "initial_region_source": "first_open_to_close_grasp_event",
+        "classification_mode": "alternating",
+        "near_initial_joint_threshold_rad": 0.35,
+        "duplicate_grasp_distance_threshold_rad": 0.20,
+        "min_grasp_gap_frames": 45,
+        "finger_open_close_signal": "actions.<active_side>_ee.qpos",
+        "finger_close_threshold": 0.35,
+        "finger_open_threshold": 0.18,
+        "finger_smooth_window": 3,
+        "pre_grasp_frames": 36,
+        "post_release_frames": 8,
+        "min_segment_frames": 30
+      }
+    }
+  ]
+}

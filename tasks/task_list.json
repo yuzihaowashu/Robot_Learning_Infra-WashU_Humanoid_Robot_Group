@@ -1,0 +1,67 @@
+{
+  "default": "Shake bottle (default)",
+  "tasks": [
+    {
+      "label": "Shake bottle (default)",
+      "name": "shake_bottle",
+      "goal": "Shake the bottle with proper arm.",
+      "desc": "Shake the bottle steadily using the selected arm mode.",
+      "steps": "step1: reach and grasp the bottle; step2: lift it slightly; step3: shake it steadily; step4: place it back safely.",
+      "splitter": {
+        "enabled": false,
+        "notes": "Single-task episode; no automatic splitter rule yet."
+      }
+    },
+    {
+      "label": "Place bottle into paper box",
+      "name": "place_bottle_in_paper_box",
+      "goal": "Place the bottle into the paper box with proper arm.",
+      "desc": "Pick up the bottle and place it accurately inside the paper box using the selected arm mode.",
+      "steps": "step1: reach and grasp the bottle; step2: lift the bottle; step3: move it above the paper box; step4: place it into the box and release.",
+      "splitter": {
+        "enabled": true,
+        "segment_type": "place_bottle_into_paper_box",
+        "start_condition": {
+          "near_initial_position": true,
+          "finger_transition": "open_to_close"
+        },
+        "end_condition": {
+          "finger_transition": "close_to_open"
+        },
+        "notes": "For long continuous recordings, split when the robot grasps near the initial bottle position; this segment is interpreted as placing the bottle into the paper box."
+      }
+    },
+    {
+      "label": "Take bottle out from paper box",
+      "name": "take_bottle_out_of_paper_box",
+      "goal": "Take the bottle out from the paper box with proper arm.",
+      "desc": "Use the selected arm to grasp the bottle in the paper box, take it out, and place it back near the start region. This is intended for continuous in-and-out collection with one long recording.",
+      "steps": "step1: reach to the bottle inside the paper box; step2: grasp the bottle; step3: lift and move it out of the paper box; step4: place it near the start region and release.",
+      "splitter": {
+        "enabled": true,
+        "segment_type": "take_bottle_out_of_paper_box",
+        "start_condition": {
+          "near_initial_position": false,
+          "finger_transition": "open_to_close"
+        },
+        "end_condition": {
+          "robot_pose_near_initial_region": true,
+          "finger_transition": "close_to_open"
+        },
+        "notes": "For long continuous recordings, split alternating backward segments as taking the bottle out from the paper box."
+      }
+    }
+  ],
+  "splitter_config": {
+    "initial_region_source": "first_open_to_close_grasp_event",
+    "near_initial_joint_threshold_rad": 0.35,
+    "finger_open_close_signal": "actions.<active_side>_ee.qpos",
+    "finger_close_threshold": 0.35,
+    "finger_open_threshold": 0.18,
+    "finger_smooth_window": 3,
+    "pre_grasp_frames": 8,
+    "post_release_frames": 8,
+    "min_segment_frames": 30,
+    "notes": "The bottle in/out splitter classifies valid grasps as alternating forward/backward segments: place_bottle_into_paper_box, then take_bottle_out_of_paper_box."
+  }
+}

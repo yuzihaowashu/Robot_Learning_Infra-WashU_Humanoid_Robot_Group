@@ -55,11 +55,14 @@ Status is received via ZMQ PUB/SUB heartbeat (`ipc://@xr_teleoperate_hb.ipc`).
 
 | Field            | Description                                    | Default          |
 |------------------|------------------------------------------------|------------------|
-| Task Name        | Directory name under `xr_recordings/`          | `pick_apple`     |
+| Task Preset      | Predefined task template that fills the fields below | `Shake bottle (default)` |
+| Episode Splitter | Optional continuous-recording splitter loaded from `tasks/splitter_list.json` | `Off` |
+| Task Name        | Directory name under `xr_recordings/`          | `shake_bottle`   |
 | Task Goal        | Saved to `data.json → text.goal`               | —                |
 | Task Description | Saved to `data.json → text.description`        | —                |
 | Task Steps       | Saved to `data.json → text.steps`              | —                |
 | Input Mode       | `controller` or `hand`                         | `controller`     |
+| Arm Mode         | `bimanual`, `left-only`, or `right-only`       | `bimanual`       |
 | Enable Locomotion (--motion) | Passes `--motion` to the teleop script | unchecked    |
 | Show PC VR Mirror | Opens an observer window on the PC monitor | checked      |
 
@@ -69,6 +72,26 @@ Buttons:
 - **Refresh Preflight** — refreshes PICO URL, certificate, PC2, and port status.
 - **Recovery / advanced → Relax / Re-park Arms** — recovery-only arm re-park action.
 
+Task presets:
+- Task presets are loaded from `tasks/task_list.json`, not hardcoded in `gradio_panel.py`.
+- `Shake bottle (default)` fills `task_name=shake_bottle`.
+- `Place bottle into paper box` fills `task_name=place_bottle_in_paper_box`.
+- `Take bottle out from paper box` fills `task_name=take_bottle_out_of_paper_box`.
+- After choosing a preset, operators can still manually edit Task Name, Goal, Description, and Steps before launching.
+
+Episode splitter:
+- Splitter modes are loaded from `tasks/splitter_list.json`.
+- `Off` preserves the normal workflow and never modifies saved episodes.
+- `Bottle in/out continuous splitter` is for one long recording with repeated bottle-in / bottle-out motions. It switches Task Name to `bottle_in_out_raw`, monitors only that raw task directory, splits the saved raw episode into `forward` (`place_bottle_in_paper_box`) and `backward` (`take_bottle_out_of_paper_box`) episodes under `raw_episode_xxxx/`, and keeps the raw episode as the source record.
+- VR Left Y toggles the raw episode marker between `forward` and `backward`. The VR HUD shows `FORWARD` in red and `BACKWARD` in green; the splitter uses these markers first, then falls back to hand/pose detection for old data without markers.
+- The splitter marker resets to `forward` whenever a new episode starts and after an episode is saved.
+- Enable Episode Splitter before recording the long continuous episode.
+
+Single-arm collection (Gradio):
+- `left-only` / `right-only` — only the active arm follows XR. From Launch deploy onward, the active arm parks in the original **q=0 forward/default** start pose between recordings, moving through an **outward clearance** waypoint first to avoid sweeping directly from a relaxed/down pose into q=0. The other arm is **automatically** held in the `relaxed` pose (`--inactive-arm-pose=relaxed`). There is no dropdown for inactive pose in the panel.
+- CLI users can still pass `--inactive-arm-pose=default|relaxed|spread|current` when launching `teleop_hand_and_arm.py` directly.
+- The inactive side is still held by the low-level arm controller so it does not drop under gravity; recorded inactive arm/end-effector action is zeros. Episodes store `info.metadata.arm_mode` and `info.metadata.inactive_arm_pose`.
+
 ### Right Column — Live Control
 
 | Button                  | IPC Command         | Keyboard Equivalent |
@@ -77,6 +100,11 @@ Buttons:
 | Toggle Recording (s)    | `CMD_RECORD_TOGGLE` | `s`                 |
 | Toggle Locomotion (m)   | `CMD_LOCO_TOGGLE`   | `m`                 |
 | EMERGENCY STOP (q)      | `CMD_STOP`          | `q`                 |
+
+VR buttons:
+- Right A saves the current episode.
+- Right B discards the current episode; it does not save.
+- Left Y marks Episode Splitter transitions (`forward` / `backward`).
 
 ### Episode History
 

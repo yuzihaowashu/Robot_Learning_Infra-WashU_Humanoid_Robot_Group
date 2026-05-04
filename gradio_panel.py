@@ -32,6 +32,92 @@ PICO_VR_PORT = 8012
 GRADIO_PORT = 7860
 TELEIMAGER_CONFIG_PORT = 60000
 TELEIMAGER_HEAD_ZMQ_PORT = 55555
+TASK_LIST_PATH = os.path.join(ROOT_DIR, "tasks", "task_list.json")
+SPLITTER_LIST_PATH = os.path.join(ROOT_DIR, "tasks", "splitter_list.json")
+
+_FALLBACK_TASK_PRESETS = {
+    "Shake bottle (default)": {
+        "name": "shake_bottle",
+        "goal": "Shake the bottle with proper arm.",
+        "desc": "Shake the bottle steadily using the selected arm mode.",
+        "steps": (
+            "step1: reach and grasp the bottle; "
+            "step2: lift it slightly; "
+            "step3: shake it steadily; "
+            "step4: place it back safely."
+        ),
+    },
+    "Place bottle into paper box": {
+        "name": "place_bottle_in_paper_box",
+        "goal": "Place the bottle into the paper box with proper arm.",
+        "desc": (
+            "Pick up the bottle and place it accurately inside the paper box "
+            "using the selected arm mode."
+        ),
+        "steps": (
+            "step1: reach and grasp the bottle; "
+            "step2: lift the bottle; "
+            "step3: move it above the paper box; "
+            "step4: place it into the box and release."
+        ),
+    },
+}
+
+
+def _load_task_presets():
+    try:
+        with open(TASK_LIST_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        presets = {}
+        for item in cfg.get("tasks", []):
+            label = item["label"]
+            presets[label] = {
+                "name": item["name"],
+                "goal": item["goal"],
+                "desc": item.get("desc", ""),
+                "steps": item.get("steps", ""),
+                "splitter": item.get("splitter", {}),
+            }
+        default_label = cfg.get("default") or next(iter(presets))
+        if default_label not in presets:
+            default_label = next(iter(presets))
+        if presets:
+            return presets, default_label
+    except Exception as exc:
+        print(f"[tasks] failed to load {TASK_LIST_PATH}: {exc}")
+    return _FALLBACK_TASK_PRESETS, "Shake bottle (default)"
+
+
+TASK_PRESETS, DEFAULT_TASK_PRESET = _load_task_presets()
+
+_FALLBACK_SPLITTER_PRESETS = {
+    "Off": {
+        "id": "off",
+        "enabled": False,
+        "delete_original_on_success": False,
+    }
+}
+
+
+def _load_splitter_presets():
+    try:
+        with open(SPLITTER_LIST_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        presets = {}
+        for item in cfg.get("splitters", []):
+            label = item["label"]
+            presets[label] = item
+        default_label = cfg.get("default") or next(iter(presets))
+        if default_label not in presets:
+            default_label = next(iter(presets))
+        if presets:
+            return presets, default_label
+    except Exception as exc:
+        print(f"[splitters] failed to load {SPLITTER_LIST_PATH}: {exc}")
+    return _FALLBACK_SPLITTER_PRESETS, "Off"
+
+
+SPLITTER_PRESETS, DEFAULT_SPLITTER_PRESET = _load_splitter_presets()
 
 sys.path.insert(0, os.path.join(ROOT_DIR, "xr_teleoperate"))
 
@@ -268,6 +354,11 @@ _ipc_client = None
 _ipc_lock = threading.Lock()
 _current_task_name = "shake_bottle"
 _current_recordings_dir = RECORDINGS_DIR
+_auto_split_lock = threading.Lock()
+_auto_split_context = None
+_auto_split_baseline: set[str] = set()
+_auto_split_attempted: set[str] = set()
+_auto_split_messages: list[str] = []
 
 
 def _resolve_recordings_dir(path):
@@ -337,7 +428,7 @@ _kill_stale_teleop()
 
 
 def launch_teleop(task_name, task_goal, task_desc, task_steps, save_dir,
-                  input_mode, mirror_vr):
+                  input_mode, arm_mode, mirror_vr):
     global _teleop_proc, _teleop_log_fh, _current_task_name, _current_recordings_dir
     _current_task_name = task_name
     _current_recordings_dir = _resolve_recordings_dir(save_dir)
@@ -349,6 +440,11 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, save_dir,
     _kill_stale_teleop()
     _destroy_ipc_client()
     os.makedirs(_current_recordings_dir, exist_ok=True)
+
+    # Gradio: single-arm modes always hold the inactive arm in `relaxed` pose (no UI toggle).
+    inactive_arm_pose = (
+        "relaxed" if arm_mode in ("left-only", "right-only") else "default"
+    )
 
     cmd = [
         sys.executable, os.path.join(XR_DIR, "teleop_hand_and_arm.py"),
@@ -362,6 +458,8 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, save_dir,
         f"--task-goal={task_goal}",
         f"--task-desc={task_desc}",
         f"--task-steps={task_steps}",
+        f"--arm-mode={arm_mode}",
+        f"--inactive-arm-pose={inactive_arm_pose}",
     ]
     # Always keep Unitree balance / arm_sdk mode active in the Gradio workflow.
     # Disabling this is only for bench/debug CLI use and can make the robot unsafe.
@@ -391,15 +489,27 @@ def launch_teleop(task_name, task_goal, task_desc, task_steps, save_dir,
             )
         client = _get_ipc_client()
         if client and client.is_online():
+            _arm_detail = (
+                f"Arm mode: {arm_mode}; non-XR arm relaxed\n"
+                if arm_mode in ("left-only", "right-only")
+                else f"Arm mode: {arm_mode}\n"
+            )
             return (
                 f"Teleop launched (PID {_teleop_proc.pid}). IPC connected.\n"
                 f"Save dir: {_current_recordings_dir}\n"
+                f"{_arm_detail}"
                 "Balance mode: always ON\n"
                 f"PICO VR URL: {pico_url}"
             )
+    _arm_detail = (
+        f"Arm mode: {arm_mode}; non-XR arm relaxed\n"
+        if arm_mode in ("left-only", "right-only")
+        else f"Arm mode: {arm_mode}\n"
+    )
     return (
         f"Teleop launched (PID {_teleop_proc.pid}), but IPC heartbeat not yet detected.\n"
         f"Save dir: {_current_recordings_dir}\n"
+        f"{_arm_detail}"
         "Balance mode: always ON\n"
         f"PICO VR URL: {pico_url}\n"
         "If PICO cannot enter VR, check the log and refresh Preflight."
@@ -487,16 +597,23 @@ def reset_arms():
                 "    if max(arm_q) < 0.15:",
                 "        print('Arms already near rest. OK')",
                 "        sys.exit(0)",
+                "    current_arm_q = np.array([state.motor_state[i].q for i in arm_ids], dtype=float)",
+                "else:",
+                "    current_arm_q = None",
                 "",
-                "# Arms are NOT relaxed — release from the current safe outward pose.",
-                "# This skips the forward-ish q=0 waypoint that can bring Dex3",
-                "# fingers close to the body before the robot relaxes down.",
+                "# Arms are NOT relaxed. If teleop already parked at outward",
+                "# stretch, do not stretch again; just release from there.",
                 "from teleop.robot_control.robot_arm import G1_29_ArmController",
                 "arm = G1_29_ArmController(motion_mode=True, safe_deploy=False)",
+                "already_outer = False",
+                "if current_arm_q is not None:",
+                "    non_roll_idx = [i for i in range(14) if i not in (1, 8)]",
+                "    already_outer = (current_arm_q[1] > 1.25 and current_arm_q[8] < -1.25 and np.max(np.abs(current_arm_q[non_roll_idx])) < 0.40)",
+                "    print(f'Already outer stretch: {already_outer}')",
                 "",
                 "# keep_holder_yield=True prevents arm_idle_holder from pulling",
                 "# the arms back to the outward spread pose immediately.",
-                "arm.ctrl_dual_arm_go_home(lower_to_zero=True, keep_holder_yield=True, skip_spread=True, clearance_path=False, skip_zero_waypoint=True)",
+                "arm.ctrl_dual_arm_go_home(lower_to_zero=True, keep_holder_yield=True, skip_spread=already_outer, clearance_path=False, skip_zero_waypoint=True, spread_min_duration=3.0, spread_timeout=4.5, spread_settle=False)",
                 "from teleop.robot_control.robot_hand_unitree import dex3_release_hands",
                 "dex3_release_hands(duration=1.0)",
                 "print('OK')",
@@ -555,7 +672,7 @@ def ipc_loco_toggle():
 _last_seen_events = 0
 
 
-def poll_status_and_episodes():
+def poll_status_and_episodes(auto_splitter_label):
     global _last_seen_events
     proc_alive = _teleop_proc is not None and _teleop_proc.poll() is None
     if not proc_alive and _ipc_client is not None:
@@ -576,6 +693,7 @@ def poll_status_and_episodes():
 
     tracking_html = _badge("TRACKING", "green") if state.get("START") else _badge("WAITING", "orange")
     loco_html = _badge("WALK ON", "green") if state.get("LOCO_ENABLED") else _badge("WALK OFF", "gray")
+    arm_mode = state.get("ARM_MODE", "—")
 
     status_html = f"""
     <div style="display:flex; gap:18px; align-items:center; flex-wrap:wrap; padding:6px 0;">
@@ -584,15 +702,20 @@ def poll_status_and_episodes():
         <span><b>Tracking:</b> {tracking_html}</span>
         <span><b>Recording:</b> {rec_html}</span>
         <span><b>Locomotion:</b> {loco_html}</span>
+        <span><b>Arm Mode:</b> <code>{arm_mode}</code></span>
     </div>"""
 
     events = state.get("EVENTS", [])
+    _maybe_auto_split_latest(auto_splitter_label)
+
     if events:
         lines = "\n".join(events[-10:])
     elif not proc_alive:
         lines = "(teleop not running)"
     else:
         lines = "(waiting for events...)"
+    if _auto_split_messages:
+        lines = lines + "\n\n" + "\n".join(_auto_split_messages[-5:])
 
     episodes = refresh_episodes(_current_task_name, _current_recordings_dir)
     return status_html, episodes, lines
@@ -628,8 +751,10 @@ def load_episodes(task_name, save_dir=None):
     if not os.path.isdir(task_dir):
         return []
     rows = []
-    for ep_dir in sorted(glob.glob(os.path.join(task_dir, "episode_*"))):
-        ep_id = os.path.basename(ep_dir)
+    ep_dirs = glob.glob(os.path.join(task_dir, "episode_*"))
+    ep_dirs += glob.glob(os.path.join(task_dir, "raw_episode_*", "episode_*"))
+    for ep_dir in sorted(ep_dirs):
+        ep_id = os.path.relpath(ep_dir, task_dir)
         data_file = os.path.join(ep_dir, "data.json")
         if not os.path.isfile(data_file):
             rows.append([ep_id, "—", "—", "—"])
@@ -653,11 +778,169 @@ def refresh_episodes(task_name, save_dir=None):
     return rows
 
 
+def _episode_data_paths(task_name, save_dir):
+    base_dir = _resolve_recordings_dir(save_dir)
+    task_dir = os.path.join(base_dir, task_name)
+    if not os.path.isdir(task_dir):
+        return []
+    return sorted(glob.glob(os.path.join(task_dir, "episode_*", "data.json")))
+
+
+def _is_split_episode(data_path):
+    try:
+        with open(data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        metadata = data.get("info", {}).get("metadata", {})
+        return bool(metadata.get("split_from"))
+    except Exception:
+        return False
+
+
+def _append_auto_split_message(message):
+    _auto_split_messages.append(message)
+    del _auto_split_messages[:-8]
+
+
+def _splitter_raw_task_name(preset, fallback_task_name):
+    raw_task = preset.get("raw_task", {}) if isinstance(preset, dict) else {}
+    return raw_task.get("name") or fallback_task_name
+
+
+def _configure_auto_splitter(
+    splitter_label,
+    task_name,
+    task_goal,
+    task_desc,
+    task_steps,
+    save_dir,
+):
+    global _auto_split_context, _auto_split_baseline, _auto_split_attempted
+    preset = SPLITTER_PRESETS.get(splitter_label, SPLITTER_PRESETS["Off"])
+    raw_task = preset.get("raw_task", {}) if preset.get("enabled") else {}
+    monitor_task_name = _splitter_raw_task_name(preset, task_name)
+    next_task_name = raw_task.get("name", task_name)
+    next_task_goal = raw_task.get("goal", task_goal)
+    next_task_desc = raw_task.get("desc", task_desc)
+    next_task_steps = raw_task.get("steps", task_steps)
+    with _auto_split_lock:
+        _auto_split_context = (
+            splitter_label,
+            monitor_task_name,
+            _resolve_recordings_dir(save_dir),
+        )
+        _auto_split_baseline = set()
+        _auto_split_attempted = set()
+    if not preset.get("enabled"):
+        status = "Episode Splitter: Off"
+        episodes = refresh_episodes(task_name, save_dir)
+        return (
+            status,
+            next_task_name,
+            next_task_goal,
+            next_task_desc,
+            next_task_steps,
+            episodes,
+        )
+    status = (
+        f"Episode Splitter: {splitter_label} enabled. Future raw episodes "
+        f"will be saved under `{monitor_task_name}`, split into task "
+        "episodes, and kept as source data."
+    )
+    episodes = refresh_episodes(monitor_task_name, save_dir)
+    return (
+        status,
+        next_task_name,
+        next_task_goal,
+        next_task_desc,
+        next_task_steps,
+        episodes,
+    )
+
+
+def _maybe_auto_split_latest(splitter_label):
+    global _auto_split_context, _auto_split_baseline, _auto_split_attempted
+    preset = SPLITTER_PRESETS.get(splitter_label, SPLITTER_PRESETS["Off"])
+    if not preset.get("enabled"):
+        return
+
+    monitor_task_name = _splitter_raw_task_name(preset, _current_task_name)
+    context = (splitter_label, monitor_task_name, _current_recordings_dir)
+    with _auto_split_lock:
+        if _auto_split_context != context:
+            _auto_split_context = context
+            _auto_split_baseline = set()
+            _auto_split_attempted = set()
+            _append_auto_split_message(
+                f"[autosplit] armed: {splitter_label} on {monitor_task_name}"
+            )
+
+        candidates = []
+        for data_path in _episode_data_paths(
+            monitor_task_name, _current_recordings_dir
+        ):
+            if data_path in _auto_split_attempted:
+                continue
+            if _is_split_episode(data_path):
+                _auto_split_baseline.add(data_path)
+                continue
+            if time.time() - os.path.getmtime(data_path) < 2.0:
+                continue
+            candidates.append(data_path)
+        if not candidates:
+            return
+        data_path = candidates[-1]
+        _auto_split_attempted.add(data_path)
+
+    splitter_id = preset.get("id")
+    cmd = [
+        sys.executable,
+        os.path.join(ROOT_DIR, "utils", "split_xr_episode.py"),
+        data_path,
+        "--splitter-id",
+        splitter_id,
+        "--write",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=120,
+        )
+    except Exception as exc:
+        _append_auto_split_message(f"[autosplit] failed: {exc}")
+        return
+
+    if proc.returncode == 0:
+        with _auto_split_lock:
+            _auto_split_baseline.add(data_path)
+        episode_name = os.path.basename(os.path.dirname(data_path))
+        _append_auto_split_message(
+            f"[autosplit] split {episode_name}; raw kept"
+        )
+    else:
+        _append_auto_split_message(
+            "[autosplit] splitter failed:\n" + proc.stdout[-1200:]
+        )
+
+
 def _update_task_context(name, save_dir):
     global _current_task_name, _current_recordings_dir
     _current_task_name = name
     _current_recordings_dir = _resolve_recordings_dir(save_dir)
     return refresh_episodes(name, _current_recordings_dir)
+
+
+def _apply_task_preset(preset_name, save_dir):
+    preset = TASK_PRESETS.get(preset_name, TASK_PRESETS[DEFAULT_TASK_PRESET])
+    task_name = preset["name"]
+    task_goal = preset["goal"]
+    task_desc = preset["desc"]
+    task_steps = preset["steps"]
+    episodes = _update_task_context(task_name, save_dir)
+    return task_name, task_goal, task_desc, task_steps, episodes
 
 
 # ---------------------------------------------------------------------------
@@ -697,23 +980,45 @@ def build_ui():
         # ==================================================================
         with gr.Group():
             gr.Markdown("## Step 1 — Configure Task", elem_classes=["step-title"])
+            task_preset = gr.Dropdown(
+                choices=list(TASK_PRESETS.keys()),
+                value=DEFAULT_TASK_PRESET,
+                label="Task Preset",
+            )
+            auto_splitter = gr.Dropdown(
+                choices=list(SPLITTER_PRESETS.keys()),
+                value=DEFAULT_SPLITTER_PRESET,
+                label="Episode Splitter",
+            )
+            auto_split_status = gr.Textbox(
+                label="Episode Splitter Status",
+                value="Episode Splitter: Off",
+                interactive=False,
+                lines=2,
+            )
+            gr.Markdown(
+                "*Choose a predefined task, then edit the fields below if "
+                "needed. Episode Splitter is optional and should be enabled "
+                "before recording one long continuous episode.*"
+            )
             with gr.Row():
+                default_preset = TASK_PRESETS[DEFAULT_TASK_PRESET]
                 task_name = gr.Textbox(
-                    label="Task Name", value="shake_bottle",
+                    label="Task Name", value=default_preset["name"],
                     placeholder="e.g. shake_bottle", scale=1,
                 )
                 task_goal = gr.Textbox(
                     label="Task Goal",
-                    value="Shake the bottle with proper arm.",
+                    value=default_preset["goal"],
                     placeholder="Short goal description", scale=2,
                 )
             with gr.Row():
                 task_desc = gr.Textbox(
-                    label="Task Description", value="",
+                    label="Task Description", value=default_preset["desc"],
                     placeholder="Detailed description (optional)", lines=2, scale=2,
                 )
                 task_steps = gr.Textbox(
-                    label="Task Steps", value="",
+                    label="Task Steps", value=default_preset["steps"],
                     placeholder="step1: ...; step2: ...;", lines=2, scale=2,
                 )
             with gr.Row():
@@ -728,9 +1033,22 @@ def build_ui():
                     ["controller"], label="Input Mode",
                     value="controller", scale=1,
                 )
+                arm_mode = gr.Radio(
+                    ["bimanual", "left-only", "right-only"],
+                    label="Arm Mode",
+                    value="bimanual",
+                    scale=2,
+                )
                 mirror_flag = gr.Checkbox(
                     label="Show PC VR Mirror", value=True, scale=1,
                 )
+            gr.Markdown(
+                "*`left-only` / `right-only`: the active arm parks in a "
+                "**q=0 forward/default** pose between recordings via an "
+                "**outward clearance** waypoint, and the non-teleoperated "
+                "arm is held in a **relaxed** pose automatically "
+                "(no extra setting).*"
+            )
 
         # ==================================================================
         # Step 2: Launch and Connect
@@ -765,6 +1083,7 @@ def build_ui():
                     task_steps,
                     save_dir,
                     input_mode,
+                    arm_mode,
                     mirror_flag,
                 ],
                 outputs=launch_output,
@@ -836,10 +1155,40 @@ def build_ui():
                         inputs=[task_name, save_dir],
                         outputs=episode_table,
                     )
+                    task_preset.change(
+                        fn=_apply_task_preset,
+                        inputs=[task_preset, save_dir],
+                        outputs=[
+                            task_name,
+                            task_goal,
+                            task_desc,
+                            task_steps,
+                            episode_table,
+                        ],
+                    )
                     save_dir.change(
                         fn=_update_task_context,
                         inputs=[task_name, save_dir],
                         outputs=episode_table,
+                    )
+                    auto_splitter.change(
+                        fn=_configure_auto_splitter,
+                        inputs=[
+                            auto_splitter,
+                            task_name,
+                            task_goal,
+                            task_desc,
+                            task_steps,
+                            save_dir,
+                        ],
+                        outputs=[
+                            auto_split_status,
+                            task_name,
+                            task_goal,
+                            task_desc,
+                            task_steps,
+                            episode_table,
+                        ],
                     )
 
                 with gr.Column(scale=1):
@@ -852,7 +1201,11 @@ def build_ui():
 
         # ---- timer: auto-refresh status + episodes + events every 1.5 s ----
         timer = gr.Timer(value=1.5)
-        timer.tick(fn=poll_status_and_episodes, outputs=[status_html, episode_table, event_log])
+        timer.tick(
+            fn=poll_status_and_episodes,
+            inputs=[auto_splitter],
+            outputs=[status_html, episode_table, event_log],
+        )
 
     return demo
 
