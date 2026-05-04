@@ -7,3 +7,6 @@
 [submodule "Psi0"]
 	path = Psi0
 	url = https://github.com/yuzihaowashu/Psi0.git
+[submodule "Diffusion-Policy"]
+	path = Diffusion-Policy
+	url = https://github.com/yuzihaowashu/diffusion_policy.git

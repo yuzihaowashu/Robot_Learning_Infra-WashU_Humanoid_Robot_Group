@@ -14,6 +14,13 @@
 #     按住 L2 直到遥控器震动，按一次对应按键，然后快速松开 L2。
 # (2) L2 + UP --> joints move to the home/stand-ready position slowly
 #     L2 + UP --> 关节会慢慢回到 home / 站立准备姿态
+#     IMPORTANT: do this only after stopping all robot-control clients
+#     that publish to rt/arm_sdk, such as vla_client.py, dp_g1_client.py,
+#     or psi0_rtc_bimanual_client.py. If one is still running, it can keep
+#     commanding its last forward/ready target and fight the remote command.
+#     重要: 只有在停止所有会发布 rt/arm_sdk 的机器人控制客户端后再按，
+#     例如 vla_client.py、dp_g1_client.py、psi0_rtc_bimanual_client.py。
+#     否则脚本可能持续发送 forward/ready 目标并和遥控器命令抢控制。
 #     NOTE: if g1-arm-holder.service is active, the arms will instead ramp
 #     to the outward spread safety pose to keep Dex3 hands away from thighs.
 #     注意: 如果 g1-arm-holder.service 正在运行，手臂会被拉到安全外展位，

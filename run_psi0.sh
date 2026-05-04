@@ -19,6 +19,8 @@ DEFAULT_PORT=8014
 DEFAULT_SERVER_PORT=22085
 DEFAULT_PSI_HOME="/home/humanoid-pc/psi0_runtime"
 DEFAULT_ACTION_EXEC_HORIZON=9
+DEFAULT_MIN_AVAILABLE_RAM_GB=18
+DEFAULT_SERVER_MEMORY_GB=24
 
 usage() {
     cat <<EOF
@@ -48,7 +50,7 @@ Usage:
                                current holds the startup waist pose
 
   bash run_psi0.sh rtc-bimanual [options]
-      Use Psi0's WebSocket RTC timing, but execute only bimanual arms/hands.
+      Use Psi0's WebSocket RTC timing with a safety-first G1 client.
       Default is dry-run; pass --execute to move the robot.
       Important options:
         --host HOST            Default: localhost
@@ -60,10 +62,16 @@ Usage:
                                Do not abort if XR teleop is still running
         --test-arm-nudge       Send a tiny arm command through arm_sdk and exit
         --waist-mode MODE      xr-upright (default), passive, current, or upright
+        --ui                   Open local web UI with camera and RTC controls
+        --ui-port PORT         Default: 8040
         --continuous           Skip step-by-step approval after --execute
         --step-seconds SEC     Hold each approved step before prompting again
         --exit-pose POSE       default (default), spread, or hold on Ctrl+C/q
         --action-mode MODE     delta (default for this release) or absolute
+        --arm-side SIDE        left (default) executes left arm/hand only;
+                               bimanual executes both arms/hands
+        --approval-steps N     RTC ticks approved by one UI Run Next click;
+                               default: 15
 
   bash run_psi0.sh rtc --raw-robot-control [--task TASK] [--port PORT]
       Run Psi0's upstream raw RTC client. Use only for debugging because it
@@ -75,6 +83,8 @@ Notes:
   - Set PSI0_PYTHON to override the Python interpreter.
   - Set PSI0_CLIENT_PYTHON to override the local client interpreter.
   - Set PSI0_ACTION_EXEC_HORIZON to override server action horizon.
+  - Set PSI0_MIN_AVAILABLE_RAM_GB to require enough free RAM before server start.
+  - Set PSI0_SERVER_MEMORY_GB to cap server RAM usage; use 0 to disable.
 EOF
 }
 
@@ -91,6 +101,52 @@ require_python() {
         echo "ERROR: Psi0 Python not found or not executable: $PSI0_PYTHON"
         echo "Run setup first, or set PSI0_PYTHON=/path/to/python"
         exit 1
+    fi
+}
+
+available_ram_gb() {
+    awk '/MemAvailable:/ {printf "%.1f", $2 / 1024 / 1024}' /proc/meminfo
+}
+
+require_available_ram() {
+    min_gb="${PSI0_MIN_AVAILABLE_RAM_GB:-$DEFAULT_MIN_AVAILABLE_RAM_GB}"
+    if [ "$min_gb" = "0" ] || [ "$min_gb" = "none" ]; then
+        echo "Skipping RAM preflight check."
+        return
+    fi
+
+    min_kb=$(awk -v gb="$min_gb" 'BEGIN {printf "%.0f", gb * 1024 * 1024}')
+    available_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+    available_gb=$(available_ram_gb)
+    echo "RAM preflight: available=${available_gb}GB required>=${min_gb}GB"
+    if [ "$available_kb" -lt "$min_kb" ]; then
+        echo "ERROR: Not enough available RAM to start Psi0 safely."
+        echo "Close other memory-heavy processes, lower PSI0_MIN_AVAILABLE_RAM_GB,"
+        echo "or set PSI0_MIN_AVAILABLE_RAM_GB=0 if you intentionally want to bypass."
+        exit 1
+    fi
+}
+
+run_with_memory_limit() {
+    limit_gb="${PSI0_SERVER_MEMORY_GB:-$DEFAULT_SERVER_MEMORY_GB}"
+    if [ "$limit_gb" = "0" ] || [ "$limit_gb" = "none" ]; then
+        echo "Server memory cap: disabled"
+        "$@"
+        return
+    fi
+
+    echo "Server memory cap: ${limit_gb}GB RAM, no swap growth"
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+        systemd-run --user --scope --same-dir --collect \
+            -p "MemoryMax=${limit_gb}G" \
+            -p "MemorySwapMax=0" \
+            "$@"
+    else
+        echo "WARNING: systemd user scopes unavailable; using ulimit fallback."
+        (
+            ulimit -v $((limit_gb * 1024 * 1024))
+            "$@"
+        )
     fi
 }
 
@@ -132,13 +188,14 @@ EOF
         echo "Starting Psi0 server: run_dir=$run_dir ckpt_step=$ckpt_step port=$port"
         echo "Psi0 runtime: $PSI_HOME"
         echo "Action exec horizon: $action_exec_horizon"
+        require_available_ram
         cd "$PSI0_DIR"
         if [ ! -d "$PSI0_ENV" ]; then
             echo "ERROR: $PSI0_ENV does not exist. Run: bash run_psi0.sh setup"
             exit 1
         fi
         source "$PSI0_ENV/bin/activate"
-        uv run --active --group psi --group serve serve_psi0 \
+        run_with_memory_limit uv run --active --group psi --group serve serve_psi0 \
             --host 0.0.0.0 \
             --port "$port" \
             --policy psi0 \
@@ -161,13 +218,14 @@ EOF
         printf 'PSI_HOME=%s\n' "$PSI_HOME" > "$PSI0_DIR/.env"
         echo "Starting Psi0 WebSocket RTC server: run_dir=$run_dir ckpt_step=$ckpt_step port=$port"
         echo "Psi0 runtime: $PSI_HOME"
+        require_available_ram
         cd "$PSI0_DIR"
         if [ ! -d "$PSI0_ENV" ]; then
             echo "ERROR: $PSI0_ENV does not exist. Run: bash run_psi0.sh setup"
             exit 1
         fi
         source "$PSI0_ENV/bin/activate"
-        uv run --active --group psi --group serve \
+        run_with_memory_limit uv run --active --group psi --group serve \
             python src/psi/deploy/psi_serve_rtc-trainingtimertc.py \
             --host 0.0.0.0 \
             --port "$port" \
