@@ -306,8 +306,10 @@ def decode_policy_action(
     if action.shape[0] < 28:
         raise ValueError(f"Expected Psi0 action dim >= 28, got {action.shape}")
 
-    hand = action[:14].copy()
-    arm = action[14:28].copy()
+    # Match the LeRobot training action layout:
+    # left_arm, right_arm, left_hand, right_hand, body.
+    arm = action[:14].copy()
+    hand = action[14:28].copy()
     if action_mode == "delta":
         arm_target = previous_target + arm
     elif action_mode == "absolute":

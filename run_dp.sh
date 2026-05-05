@@ -319,7 +319,7 @@ EOF
 import numpy as np
 
 action_indices = np.array(
-    [0, 1, 2, 3, 4, 5, 6, 15, 16, 17, 18, 19, 20, 30],
+    [0, 1, 2, 3, 4, 5, 6, 14, 15, 16, 17, 18, 19, 20],
     dtype=np.int64,
 )
 action_14 = np.arange(14, dtype=np.float32)
@@ -327,7 +327,7 @@ action_31 = np.zeros(31, dtype=np.float32)
 action_31[action_indices] = action_14
 assert action_31.shape == (31,)
 assert np.all(action_31[action_indices] == action_14)
-assert np.all(action_31[[7, 8, 9, 10, 11, 12, 13, 14]] == 0)
+assert np.all(action_31[[7, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]] == 0)
 left_arm = action_31[:7]
 left_hand = action_31[14:21]
 assert left_arm.shape == (7,)

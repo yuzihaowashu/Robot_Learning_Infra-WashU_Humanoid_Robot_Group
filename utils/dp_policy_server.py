@@ -35,7 +35,7 @@ STATE_INDICES = np.array(
     dtype=np.int64,
 )
 ACTION_INDICES = np.array(
-    [0, 1, 2, 3, 4, 5, 6, 15, 16, 17, 18, 19, 20, 30],
+    [0, 1, 2, 3, 4, 5, 6, 14, 15, 16, 17, 18, 19, 20],
     dtype=np.int64,
 )
 DEFAULT_RUNTIME_DIR = Path.home() / "dp_runtime"
