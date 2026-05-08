@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import shutil
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,6 +25,24 @@ DEFAULT_TACTILE_DIM = 216
 DEFAULT_TASKS = (
     "place_bottle_in_paper_box",
     "take_bottle_out_of_paper_box",
+)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+WBC_DIR = (
+    ROOT_DIR
+    / "Isaac-GR00T"
+    / "external_dependencies"
+    / "GR00T-WholeBodyControl"
+)
+EEF_POSE_DIM = 7
+GRIPPER_DIM = 1
+OPEN_HAND_Q = np.zeros(7, dtype=np.float32)
+CLOSED_LEFT_HAND_Q = np.array(
+    [0.0, 1.0, 1.74, -1.57, -1.74, -1.57, -1.74],
+    dtype=np.float32,
+)
+CLOSED_RIGHT_HAND_Q = np.array(
+    [0.0, -1.0, -1.74, 1.57, 1.74, 1.57, 1.74],
+    dtype=np.float32,
 )
 
 
@@ -81,6 +100,100 @@ def build_action(frame: dict[str, Any]) -> list[float]:
         + get_qpos(frame, "actions", "right_ee")
         + get_qpos(frame, "actions", "body")
     )
+
+
+def hand_qpos_to_gripper(hand_qpos: list[float], side: str) -> list[float]:
+    q = np.asarray(hand_qpos, dtype=np.float32)
+    if q.shape != (7,):
+        return [0.0]
+    closed = CLOSED_LEFT_HAND_Q if side == "left" else CLOSED_RIGHT_HAND_Q
+    open_dist = float(np.linalg.norm(q - OPEN_HAND_Q))
+    close_dist = float(np.linalg.norm(q - closed))
+    denom = open_dist + close_dist
+    if denom <= 1e-6:
+        return [0.0]
+    # Smooth scalar: 0=open, 1=closed, intermediate values keep transitions.
+    return [float(np.clip(open_dist / denom, 0.0, 1.0))]
+
+
+def build_gripper(frame: dict[str, Any], section: str) -> dict[str, list[float]]:
+    return {
+        "left": hand_qpos_to_gripper(
+            get_qpos(frame, section, "left_ee"),
+            "left",
+        ),
+        "right": hand_qpos_to_gripper(
+            get_qpos(frame, section, "right_ee"),
+            "right",
+        ),
+    }
+
+
+def _pose_to_xyz_quat(se3: Any) -> list[float]:
+    import pinocchio as pin
+
+    quat = pin.Quaternion(se3.rotation)
+    quat.normalize()
+    coeffs = quat.coeffs()
+    return (
+        [float(x) for x in se3.translation]
+        + [float(x) for x in coeffs]
+    )
+
+
+class WristYawLinkFK:
+    def __init__(self) -> None:
+        if not WBC_DIR.exists():
+            raise FileNotFoundError(f"Missing WBC dependency: {WBC_DIR}")
+        if str(WBC_DIR) not in sys.path:
+            sys.path.insert(0, str(WBC_DIR))
+        from gr00t_wbc.control.robot_model.instantiation.g1 import (
+            instantiate_g1_robot_model,
+        )
+
+        self.robot_model = instantiate_g1_robot_model()
+        self.left_frame = self.robot_model.supplemental_info.hand_frame_names["left"]
+        self.right_frame = self.robot_model.supplemental_info.hand_frame_names["right"]
+        self.default_body_q = self.robot_model.get_body_actuated_joints(
+            self.robot_model.get_default_body_pose()
+        ).astype(np.float32)
+
+    def _body_q_from_frame(
+        self,
+        frame: dict[str, Any],
+        section: str,
+    ) -> np.ndarray:
+        body_q = self.default_body_q.copy()
+        recorded_body = get_qpos(frame, section, "body")
+        if len(recorded_body) >= 15:
+            body_q[:15] = np.asarray(recorded_body[:15], dtype=np.float32)
+
+        left_arm = get_qpos(frame, section, "left_arm")
+        right_arm = get_qpos(frame, section, "right_arm")
+        if len(left_arm) == 7:
+            body_q[15:22] = np.asarray(left_arm, dtype=np.float32)
+        if len(right_arm) == 7:
+            body_q[22:29] = np.asarray(right_arm, dtype=np.float32)
+        return body_q
+
+    def wrist_poses(
+        self,
+        frame: dict[str, Any],
+        section: str,
+    ) -> dict[str, list[float]]:
+        body_q = self._body_q_from_frame(frame, section)
+        q = self.robot_model.get_configuration_from_actuated_joints(
+            body_actuated_joint_values=body_q
+        )
+        self.robot_model.cache_forward_kinematics(q, auto_clip=False)
+        return {
+            "left": _pose_to_xyz_quat(
+                self.robot_model.frame_placement(self.left_frame)
+            ),
+            "right": _pose_to_xyz_quat(
+                self.robot_model.frame_placement(self.right_frame)
+            ),
+        }
 
 
 def flatten_tactile(frame: dict[str, Any], tactile_dim: int) -> list[float]:
@@ -196,25 +309,51 @@ def vector_stats(values: list[list[float]]) -> dict[str, Any]:
 
 class XrToLeRobotConverter:
     def __init__(
-        self, camera: str, fps: int, chunks_size: int, tactile_dim: int
+        self,
+        camera: str,
+        fps: int,
+        chunks_size: int,
+        tactile_dim: int,
+        include_eef: bool = False,
+        include_gripper: bool = False,
     ):
         self.camera = camera
         self.fps = fps
         self.chunks_size = chunks_size
         self.tactile_dim = tactile_dim
-        self.features = Features(
-            {
-                "states": Sequence(Value("float32")),
-                "action": Sequence(Value("float32")),
-                "observation.tactile": Sequence(Value("float32")),
-                "timestamp": Value("float32"),
-                "frame_index": Value("int64"),
-                "episode_index": Value("int64"),
-                "index": Value("int64"),
-                "task_index": Value("int64"),
-                "next.done": Value("bool"),
-            }
-        )
+        self.include_eef = include_eef
+        self.include_gripper = include_gripper
+        feature_dict = {
+            "states": Sequence(Value("float32")),
+            "action": Sequence(Value("float32")),
+            "observation.tactile": Sequence(Value("float32")),
+            "timestamp": Value("float32"),
+            "frame_index": Value("int64"),
+            "episode_index": Value("int64"),
+            "index": Value("int64"),
+            "task_index": Value("int64"),
+            "next.done": Value("bool"),
+        }
+        if include_eef:
+            feature_dict.update(
+                {
+                    "observation.eef.left": Sequence(Value("float32")),
+                    "observation.eef.right": Sequence(Value("float32")),
+                    "action.eef.left": Sequence(Value("float32")),
+                    "action.eef.right": Sequence(Value("float32")),
+                }
+            )
+        if include_gripper:
+            feature_dict.update(
+                {
+                    "observation.gripper.left": Sequence(Value("float32")),
+                    "observation.gripper.right": Sequence(Value("float32")),
+                    "action.gripper.left": Sequence(Value("float32")),
+                    "action.gripper.right": Sequence(Value("float32")),
+                }
+            )
+        self.features = Features(feature_dict)
+        self.eef_fk = WristYawLinkFK() if include_eef else None
         self.task_meta: dict[int, dict[str, Any]] = {}
         self.episode_meta: list[dict[str, Any]] = []
         self.episode_stats: list[dict[str, Any]] = []
@@ -247,13 +386,22 @@ class XrToLeRobotConverter:
         states: list[list[float]] = []
         actions: list[list[float]] = []
         tactile_values: list[list[float]] = []
+        obs_eef_left_values: list[list[float]] = []
+        obs_eef_right_values: list[list[float]] = []
+        action_eef_left_values: list[list[float]] = []
+        action_eef_right_values: list[list[float]] = []
+        obs_gripper_left_values: list[list[float]] = []
+        obs_gripper_right_values: list[list[float]] = []
+        action_gripper_left_values: list[list[float]] = []
+        action_gripper_right_values: list[list[float]] = []
         rows: list[dict[str, Any]] = []
         image_paths: list[Path] = []
         global_start = dataset_cursor
 
         for frame_index, frame in enumerate(frames[:-1]):
+            next_frame = frames[frame_index + 1]
             state = build_state(frame)
-            action = build_action(frames[frame_index + 1])
+            action = build_action(next_frame)
             tactile = flatten_tactile(frame, self.tactile_dim)
             if self.state_dim is None:
                 self.state_dim = len(state)
@@ -281,19 +429,49 @@ class XrToLeRobotConverter:
             actions.append(action)
             tactile_values.append(tactile)
             image_paths.append(image_path(episode_dir, frame, self.camera))
-            rows.append(
-                {
-                    "states": state,
-                    "action": action,
-                    "observation.tactile": tactile,
-                    "timestamp": frame_index / float(self.fps),
-                    "frame_index": frame_index,
-                    "episode_index": episode_index,
-                    "index": global_start + frame_index,
-                    "task_index": task_index,
-                    "next.done": frame_index == len(frames) - 2,
-                }
-            )
+            row = {
+                "states": state,
+                "action": action,
+                "observation.tactile": tactile,
+                "timestamp": frame_index / float(self.fps),
+                "frame_index": frame_index,
+                "episode_index": episode_index,
+                "index": global_start + frame_index,
+                "task_index": task_index,
+                "next.done": frame_index == len(frames) - 2,
+            }
+            if self.include_eef:
+                assert self.eef_fk is not None
+                obs_eef = self.eef_fk.wrist_poses(frame, "states")
+                action_eef = self.eef_fk.wrist_poses(next_frame, "actions")
+                row.update(
+                    {
+                        "observation.eef.left": obs_eef["left"],
+                        "observation.eef.right": obs_eef["right"],
+                        "action.eef.left": action_eef["left"],
+                        "action.eef.right": action_eef["right"],
+                    }
+                )
+                obs_eef_left_values.append(obs_eef["left"])
+                obs_eef_right_values.append(obs_eef["right"])
+                action_eef_left_values.append(action_eef["left"])
+                action_eef_right_values.append(action_eef["right"])
+            if self.include_gripper:
+                obs_gripper = build_gripper(frame, "states")
+                action_gripper = build_gripper(next_frame, "actions")
+                row.update(
+                    {
+                        "observation.gripper.left": obs_gripper["left"],
+                        "observation.gripper.right": obs_gripper["right"],
+                        "action.gripper.left": action_gripper["left"],
+                        "action.gripper.right": action_gripper["right"],
+                    }
+                )
+                obs_gripper_left_values.append(obs_gripper["left"])
+                obs_gripper_right_values.append(obs_gripper["right"])
+                action_gripper_left_values.append(action_gripper["left"])
+                action_gripper_right_values.append(action_gripper["right"])
+            rows.append(row)
 
         chunk_id = episode_index // self.chunks_size
         data_path = (
@@ -327,15 +505,39 @@ class XrToLeRobotConverter:
                 "source": str(episode_dir),
             }
         )
+        stats = {
+            "states": vector_stats(states),
+            "action": vector_stats(actions),
+            "observation.tactile": vector_stats(tactile_values),
+        }
+        if self.include_eef:
+            stats.update(
+                {
+                    "observation.eef.left": vector_stats(obs_eef_left_values),
+                    "observation.eef.right": vector_stats(obs_eef_right_values),
+                    "action.eef.left": vector_stats(action_eef_left_values),
+                    "action.eef.right": vector_stats(action_eef_right_values),
+                }
+            )
+        if self.include_gripper:
+            stats.update(
+                {
+                    "observation.gripper.left": vector_stats(
+                        obs_gripper_left_values
+                    ),
+                    "observation.gripper.right": vector_stats(
+                        obs_gripper_right_values
+                    ),
+                    "action.gripper.left": vector_stats(
+                        action_gripper_left_values
+                    ),
+                    "action.gripper.right": vector_stats(
+                        action_gripper_right_values
+                    ),
+                }
+            )
         self.episode_stats.append(
-            {
-                "episode_index": episode_index,
-                "stats": {
-                    "states": vector_stats(states),
-                    "action": vector_stats(actions),
-                    "observation.tactile": vector_stats(tactile_values),
-                },
-            }
+            {"episode_index": episode_index, "stats": stats}
         )
         self.total_frames += len(rows)
         return len(rows)
@@ -390,6 +592,46 @@ class XrToLeRobotConverter:
             "task_index": {"dtype": "int64", "shape": [1]},
             "next.done": {"dtype": "bool", "shape": [1]},
         }
+        if self.include_eef:
+            eef_names = ["x", "y", "z", "qx", "qy", "qz", "qw"]
+            features_meta.update(
+                {
+                    "observation.eef.left": {
+                        "dtype": "float32",
+                        "shape": [EEF_POSE_DIM],
+                        "names": eef_names,
+                    },
+                    "observation.eef.right": {
+                        "dtype": "float32",
+                        "shape": [EEF_POSE_DIM],
+                        "names": eef_names,
+                    },
+                    "action.eef.left": {
+                        "dtype": "float32",
+                        "shape": [EEF_POSE_DIM],
+                        "names": eef_names,
+                    },
+                    "action.eef.right": {
+                        "dtype": "float32",
+                        "shape": [EEF_POSE_DIM],
+                        "names": eef_names,
+                    },
+                }
+            )
+        if self.include_gripper:
+            gripper_feature = {
+                "dtype": "float32",
+                "shape": [GRIPPER_DIM],
+                "names": ["open_to_closed"],
+            }
+            features_meta.update(
+                {
+                    "observation.gripper.left": gripper_feature,
+                    "observation.gripper.right": gripper_feature,
+                    "action.gripper.left": gripper_feature,
+                    "action.gripper.right": gripper_feature,
+                }
+            )
         info = InfoDict(
             codebase_version=CODE_VERSION,
             robot_type="g1",
@@ -475,6 +717,8 @@ This dataset was converted from G1 XR teleoperation recordings.
 - State dimension: {self.state_dim}
 - Action dimension: {self.action_dim}
 - Tactile dimension: {self.observation_tactile_dim}
+- EEF fields: {'enabled' if self.include_eef else 'disabled'}
+- Gripper scalar fields: {'enabled' if self.include_gripper else 'disabled'}
 
 ## Tasks
 
@@ -517,6 +761,19 @@ def summarize_dataset(out_dir: Path) -> None:
         "  tactile_dim="
         f"{info['features']['observation.tactile']['shape'][0]}"
     )
+    eef_keys = [
+        key for key in info["features"]
+        if key.startswith("observation.eef.") or key.startswith("action.eef.")
+    ]
+    if eef_keys:
+        print(f"  eef_fields={sorted(eef_keys)}")
+    gripper_keys = [
+        key for key in info["features"]
+        if key.startswith("observation.gripper.")
+        or key.startswith("action.gripper.")
+    ]
+    if gripper_keys:
+        print(f"  gripper_fields={sorted(gripper_keys)}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -532,6 +789,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--tactile-dim", type=int, default=DEFAULT_TACTILE_DIM)
     parser.add_argument("--chunks-size", type=int, default=1000)
+    parser.add_argument(
+        "--include-eef",
+        action="store_true",
+        help=(
+            "Add wrist yaw link EEF pose fields computed from qpos: "
+            "[x,y,z,qx,qy,qz,qw]."
+        ),
+    )
+    parser.add_argument(
+        "--include-gripper",
+        action="store_true",
+        help=(
+            "Add smooth binary-gripper scalar fields computed from Dex3 qpos. "
+            "0=open, 1=closed."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--push", action="store_true")
     parser.add_argument("--repo-id", type=str, default=None)
@@ -556,7 +829,12 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     converter = XrToLeRobotConverter(
-        args.camera, args.fps, args.chunks_size, args.tactile_dim
+        args.camera,
+        args.fps,
+        args.chunks_size,
+        args.tactile_dim,
+        include_eef=args.include_eef,
+        include_gripper=args.include_gripper,
     )
     cursor = 0
     for episode_index, (

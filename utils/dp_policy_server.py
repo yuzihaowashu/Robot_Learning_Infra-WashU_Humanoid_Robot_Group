@@ -68,11 +68,55 @@ def preprocess_image(image: np.ndarray, image_size: int) -> torch.Tensor:
     return torch.from_numpy(chw)
 
 
-def build_state_23(state_63: np.ndarray) -> np.ndarray:
+def cfg_get(cfg: Any, path: str, default: Any = None) -> Any:
+    cur = cfg
+    try:
+        for part in path.split("."):
+            cur = getattr(cur, part) if hasattr(cur, part) else cur[part]
+        return cur
+    except Exception:
+        return default
+
+
+def build_joint_state_23(state_63: np.ndarray) -> np.ndarray:
     state_63 = np.asarray(state_63, dtype=np.float32)
     if state_63.shape[-1] != 63:
         raise ValueError(f"Expected state dim 63, got {state_63.shape}")
     return state_63[..., STATE_INDICES]
+
+
+def build_policy_state(payload: dict[str, Any], state_dim: int) -> np.ndarray:
+    if state_dim == 23:
+        if "state" not in payload:
+            raise ValueError(
+                "Joint policy request must include 63D field: state"
+            )
+        return build_joint_state_23(
+            np.asarray(payload["state"], dtype=np.float32)
+        )
+
+    if "state_eef" in payload:
+        state = np.asarray(payload["state_eef"], dtype=np.float32)
+    elif "state_8" in payload:
+        state = np.asarray(payload["state_8"], dtype=np.float32)
+    elif "state" in payload:
+        state = np.asarray(payload["state"], dtype=np.float32)
+    elif "eef_left" in payload and "gripper_left" in payload:
+        eef = np.asarray(payload["eef_left"], dtype=np.float32)
+        gripper = np.asarray(payload["gripper_left"], dtype=np.float32)
+        state = np.concatenate([eef.reshape(-1), gripper.reshape(-1)], axis=0)
+    else:
+        raise ValueError(
+            "EEF policy request must include state_eef/state_8/state or "
+            "eef_left + gripper_left"
+        )
+
+    state = np.asarray(state, dtype=np.float32).reshape(-1)
+    if state.shape[-1] != state_dim:
+        raise ValueError(
+            f"Expected policy state dim {state_dim}, got {state.shape}"
+        )
+    return state
 
 
 class DPPolicyServer:
@@ -97,12 +141,29 @@ class DPPolicyServer:
         self.policy = workspace.ema_model if use_ema else workspace.model
         self.policy.to(self.device)
         self.policy.eval()
+        shape_meta = cfg_get(workspace.cfg, "shape_meta") or cfg_get(
+            workspace.cfg, "task.shape_meta", {}
+        )
+        self.policy_state_dim = int(
+            shape_meta.get("obs", {}).get("states", {}).get("shape", [23])[0]
+        )
+        self.policy_action_dim = int(
+            shape_meta.get("action", {}).get("shape", [14])[0]
+        )
+        self.dataset_state_keys = list(
+            cfg_get(workspace.cfg, "task.dataset.state_keys", [])
+        )
+        self.dataset_action_keys = list(
+            cfg_get(workspace.cfg, "task.dataset.action_keys", [])
+        )
+        self.metadata = dict(cfg_get(workspace.cfg, "metadata", {}) or {})
         self.image_history: deque[torch.Tensor] = deque(maxlen=obs_horizon)
         self.state_history: deque[np.ndarray] = deque(maxlen=obs_horizon)
         print(
             "[DP] Ready. "
             f"use_ema={use_ema}, obs_horizon={obs_horizon}, "
-            f"device={self.device}"
+            f"device={self.device}, state_dim={self.policy_state_dim}, "
+            f"action_dim={self.policy_action_dim}"
         )
 
     def reset(self) -> dict[str, Any]:
@@ -117,15 +178,13 @@ class DPPolicyServer:
 
     def predict(self, payload: dict[str, Any]) -> dict[str, Any]:
         image = preprocess_image(decode_image(payload), self.image_size)
-        state_23 = build_state_23(
-            np.asarray(payload["state"], dtype=np.float32)
-        )
+        policy_state = build_policy_state(payload, self.policy_state_dim)
 
         self.image_history.append(image)
-        self.state_history.append(state_23)
+        self.state_history.append(policy_state)
         while len(self.image_history) < self.obs_horizon:
             self.image_history.appendleft(image.clone())
-            self.state_history.appendleft(state_23.copy())
+            self.state_history.appendleft(policy_state.copy())
 
         color = torch.stack(list(self.image_history), dim=0)
         states = np.stack(list(self.state_history), axis=0).astype(np.float32)
@@ -136,17 +195,31 @@ class DPPolicyServer:
 
         with torch.inference_mode():
             result = self.policy.predict_action(obs)
-        action_14 = result["action"].detach().cpu().numpy().astype(np.float32)
-        action_31 = expand_action_14_to_31(action_14)
+        action = result["action"].detach().cpu().numpy().astype(np.float32)
 
-        return {
-            "action_14": action_14[0].tolist(),
-            "action_31": action_31[0].tolist(),
-            "action_indices": ACTION_INDICES.tolist(),
-            "state_indices": STATE_INDICES.tolist(),
+        response = {
+            "action": action[0].tolist(),
+            "policy_state_dim": self.policy_state_dim,
+            "policy_action_dim": self.policy_action_dim,
+            "state_keys": self.dataset_state_keys,
+            "action_keys": self.dataset_action_keys,
             "text_conditioned": False,
             "task": "g1-bottle-in-out",
         }
+        if self.policy_action_dim == 14:
+            action_31 = expand_action_14_to_31(action)
+            response.update(
+                {
+                    "action_14": action[0].tolist(),
+                    "action_31": action_31[0].tolist(),
+                    "action_indices": ACTION_INDICES.tolist(),
+                    "state_indices": STATE_INDICES.tolist(),
+                }
+            )
+        elif self.policy_action_dim == 8:
+            response["action_eef_left"] = action[0, :, :7].tolist()
+            response["action_gripper_left"] = action[0, :, 7:].tolist()
+        return response
 
 
 def default_checkpoint(model_dir: Path) -> Path:

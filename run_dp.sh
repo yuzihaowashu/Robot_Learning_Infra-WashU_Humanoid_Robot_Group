@@ -62,9 +62,15 @@ Common options:
     --execute
     --send-hands / --no-send-hands
     --hand-mode MODE   open/current/policy, default: open
+    --policy-output MODE  joint (default) or eef (wrist pose + gripper DP + IK)
+    --eef-gripper-mode MODE  interp/binary for eef gripper scalar
+    --eef-gripper-open-threshold / --eef-gripper-close-threshold
     --continuous
     --step-seconds SEC
     --action-exec-steps N  Chunk prefix to execute per UI click/approval
+    --action-mode MODE arm absolute/delta, default: absolute
+    --hand-action-mode MODE auto/absolute/delta, default: auto
+    --max-hand-delta VALUE  Finger clamp for --hand-mode policy, default: 0.6; 0 disables
     --arm-kp VALUE     Arm/waist position KP, default: 200
     --arm-kd VALUE     Arm/waist position KD, default: 5
     --waist-mode MODE  upright/current, default: upright
