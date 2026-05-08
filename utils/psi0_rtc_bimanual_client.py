@@ -61,6 +61,17 @@ TEST_NUDGE_RAD = 0.08
 KP_WAIST_XR = 200.0
 KD_WAIST_XR = 5.0
 OPEN_HAND_Q = np.zeros(N_HAND_MOTORS, dtype=np.float32)
+CLOSED_LEFT_HAND_Q = np.array(
+    [0.0, 1.0, 1.74, -1.57, -1.74, -1.57, -1.74],
+    dtype=np.float32,
+)
+CLOSED_RIGHT_HAND_Q = np.array(
+    [0.0, -1.0, -1.74, 1.57, 1.74, 1.57, 1.74],
+    dtype=np.float32,
+)
+CLOSED_DUAL_HAND_Q = np.concatenate(
+    [CLOSED_LEFT_HAND_Q, CLOSED_RIGHT_HAND_Q]
+).astype(np.float32)
 SPREAD_ARM_Q = np.zeros(14, dtype=np.float32)
 SPREAD_ARM_Q[1] = 1.5
 SPREAD_ARM_Q[8] = -1.5
@@ -297,7 +308,9 @@ class Psi0RTCWebSocketClient:
 def decode_policy_action(
     action,
     current_arm,
+    current_hand,
     previous_target,
+    previous_hand_target,
     action_mode,
     arm_side,
 ):
@@ -305,15 +318,18 @@ def decode_policy_action(
         action = action[0]
     if action.shape[0] < 28:
         raise ValueError(f"Expected Psi0 action dim >= 28, got {action.shape}")
+    if previous_hand_target is None:
+        previous_hand_target = current_hand
 
-    # Match the LeRobot training action layout:
-    # left_arm, right_arm, left_hand, right_hand, body.
-    arm = action[:14].copy()
-    hand = action[14:28].copy()
+    # HEPosttrain G1 order: left_hand, right_hand, left_arm, right_arm.
+    hand = action[:14].copy()
+    arm = action[14:28].copy()
     if action_mode == "delta":
         arm_target = previous_target + arm
+        hand_target_full = previous_hand_target + hand
     elif action_mode == "absolute":
         arm_target = arm
+        hand_target_full = hand
     else:
         raise ValueError(f"Unknown action mode: {action_mode}")
 
@@ -324,14 +340,16 @@ def decode_policy_action(
     )
     if arm_side == "left":
         right_target = previous_target[7:14].copy()
-        hand_target = np.concatenate([hand[:N_HAND_MOTORS], OPEN_HAND_Q])
+        hand_target = np.concatenate(
+            [hand_target_full[:N_HAND_MOTORS], OPEN_HAND_Q]
+        )
     elif arm_side == "bimanual":
         right_target = G1Adapter._clamp_joints(
             arm_target[7:14],
             RIGHT_ARM_JOINTS,
             current_arm[7:14],
         )
-        hand_target = hand
+        hand_target = hand_target_full
     else:
         raise ValueError(f"Unknown arm side: {arm_side}")
     return np.concatenate([left_target, right_target]), hand_target
@@ -479,6 +497,14 @@ def open_hands(robot, duration=0.8):
         time.sleep(CONTROL_DT)
 
 
+def close_hands(robot, duration=0.8):
+    print("[HAND] Closing Dex3 hands into compact pose.")
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        robot.send_hand_cmd(CLOSED_LEFT_HAND_Q, CLOSED_RIGHT_HAND_Q)
+        time.sleep(CONTROL_DT)
+
+
 def ramp_to_preparation_pose(robot, waist_mode, arm_side):
     state = robot.get_state()
     start = np.concatenate([state["left_arm"], state["right_arm"]]).astype(
@@ -493,6 +519,7 @@ def ramp_to_preparation_pose(robot, waist_mode, arm_side):
     print(f"[PREP] Moving to preparation pose ({duration:.1f}s)...")
     print(f"  Start:  {_fmt_deg(start)}")
     print(f"  Target: {_fmt_deg(target)}")
+    close_hands(robot)
 
     t0 = time.time()
     while time.time() - t0 < duration:
@@ -519,7 +546,9 @@ def run_control_loop(args, robot, action_buffer):
     state = robot.get_state()
     target_arm = current_dual_arm(robot)
     waist_target = select_waist_target(state, args.waist_mode)
-    target_hand = None
+    target_hand = np.concatenate([state["left_hand"], state["right_hand"]]).astype(
+        np.float32
+    )
 
     print("[CTRL] RTC control loop started.")
     print(
@@ -543,13 +572,18 @@ def run_control_loop(args, robot, action_buffer):
         current_arm = np.concatenate(
             [state["left_arm"], state["right_arm"]]
         ).astype(np.float32)
+        current_hand = np.concatenate(
+            [state["left_hand"], state["right_hand"]]
+        ).astype(np.float32)
 
         if action is not None and version != previous_version:
             if args.execute and not args.continuous and time.time() < hold_until:
                 target_arm, target_hand = decode_policy_action(
                     action,
                     current_arm,
+                    current_hand,
                     target_arm,
+                    target_hand,
                     args.action_mode,
                     args.arm_side,
                 )
@@ -558,7 +592,9 @@ def run_control_loop(args, robot, action_buffer):
                 proposed_arm, proposed_hand = decode_policy_action(
                     action,
                     current_arm,
+                    current_hand,
                     target_arm,
+                    target_hand,
                     args.action_mode,
                     args.arm_side,
                 )
@@ -639,7 +675,9 @@ def run_ui_control_loop(
     state = robot.get_state()
     target_arm = current_dual_arm(robot)
     waist_target = select_waist_target(state, args.waist_mode)
-    target_hand = None
+    target_hand = np.concatenate([state["left_hand"], state["right_hand"]]).astype(
+        np.float32
+    )
     next_tick = time.perf_counter()
 
     while True:
@@ -648,11 +686,16 @@ def run_ui_control_loop(
                 return
             paused = ui_state["paused"]
             manual_arm_target = ui_state.get("manual_arm_target")
+            manual_hand_target = ui_state.get("manual_hand_target")
 
         if manual_arm_target is not None:
             target_arm = np.asarray(manual_arm_target, dtype=np.float32)
             with ui_lock:
                 ui_state["manual_arm_target"] = None
+        if manual_hand_target is not None:
+            target_hand = np.asarray(manual_hand_target, dtype=np.float32)
+            with ui_lock:
+                ui_state["manual_hand_target"] = None
 
         if stop_event.is_set() or paused:
             time.sleep(0.05)
@@ -667,12 +710,17 @@ def run_ui_control_loop(
         current_arm = np.concatenate(
             [state["left_arm"], state["right_arm"]]
         ).astype(np.float32)
+        current_hand = np.concatenate(
+            [state["left_hand"], state["right_hand"]]
+        ).astype(np.float32)
 
         if action is not None and version != previous_version:
             proposed_arm, proposed_hand = decode_policy_action(
                 action,
                 current_arm,
+                current_hand,
                 target_arm,
+                target_hand,
                 args.action_mode,
                 args.arm_side,
             )
@@ -777,6 +825,7 @@ def run_control_ui(args, robot, camera, action_buffer, ws_client):
         "waist_mode": args.waist_mode,
         "send_hands": args.send_hands,
         "manual_arm_target": None,
+        "manual_hand_target": None,
     }
 
     ctrl_thread = threading.Thread(
@@ -996,7 +1045,11 @@ def run_control_ui(args, robot, camera, action_buffer, ws_client):
         update_state(
             paused=True,
             approve_budget=0,
-            message="Preparation requested; moving to ready pose and opening hands.",
+            manual_hand_target=np.round(CLOSED_DUAL_HAND_Q, 6).tolist(),
+            message=(
+                "Preparation requested; closing hands, moving to ready pose, "
+                "then reopening hands."
+            ),
         )
         if args.execute:
             target = ramp_to_preparation_pose(
@@ -1008,8 +1061,11 @@ def run_control_ui(args, robot, camera, action_buffer, ws_client):
             update_state(
                 paused=False,
                 manual_arm_target=np.round(target, 6).tolist(),
+                manual_hand_target=np.round(
+                    np.concatenate([OPEN_HAND_Q, OPEN_HAND_Q]), 6
+                ).tolist(),
                 message=(
-                    "Preparation complete; hands opened; waiting for RTC "
+                    "Preparation complete; hands reopened; waiting for RTC "
                     "action approval."
                 ),
             )
@@ -1018,6 +1074,9 @@ def run_control_ui(args, robot, camera, action_buffer, ws_client):
             update_state(
                 paused=False,
                 manual_arm_target=np.round(PREPARE_ARM_Q, 6).tolist(),
+                manual_hand_target=np.round(
+                    np.concatenate([OPEN_HAND_Q, OPEN_HAND_Q]), 6
+                ).tolist(),
                 message="Dry-run preparation complete.",
             )
         with ui_lock:
@@ -1035,13 +1094,18 @@ def run_control_ui(args, robot, camera, action_buffer, ws_client):
 
     @app.post("/resume")
     def resume():
+        if args.execute:
+            close_hands(robot)
         stop_event.clear()
         with ui_lock:
             ui_state["paused"] = False
             ui_state["continuous"] = False
             ui_state["approve_budget"] = 0
+            ui_state["manual_hand_target"] = np.round(
+                CLOSED_DUAL_HAND_Q, 6
+            ).tolist()
             ui_state["message"] = (
-                "Resumed approval mode; no action approved. "
+                "Closed hands and resumed approval mode; no action approved. "
                 "Press Run Next RTC Chunk to execute one chunk."
             )
             return dict(ui_state)
@@ -1056,10 +1120,13 @@ def run_control_ui(args, robot, camera, action_buffer, ws_client):
             message="Relax requested; moving arms to relaxed pose.",
         )
         if args.execute:
+            close_hands(robot)
             return_arms_on_exit(robot, args.waist_mode, args.exit_pose)
-            open_hands(robot)
         with ui_lock:
-            ui_state["message"] = "Relaxed arms and opened hands. Control loop is paused."
+            ui_state["manual_hand_target"] = np.round(
+                CLOSED_DUAL_HAND_Q, 6
+            ).tolist()
+            ui_state["message"] = "Relaxed arms and closed hands. Control loop is paused."
             return dict(ui_state)
 
     def video_stream():

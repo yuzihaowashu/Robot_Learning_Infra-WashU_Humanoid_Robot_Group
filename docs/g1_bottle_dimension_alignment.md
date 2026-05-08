@@ -7,7 +7,7 @@ Short answer:
 
 ```text
 Diffusion Policy 14D mapping: fixed.
-Psi0 31D deployment decode: fixed to match the LeRobot training action layout.
+Psi0 31D deployment decode: fixed to match the HEPosttrain checkpoint layout.
 ```
 
 The core issue is not whether Psi0 trains on 31D action instead of 14D action.
@@ -60,8 +60,9 @@ Therefore the LeRobot-style 31D action layout is:
 28..30    body / torso slots
 ```
 
-This is the layout that a model learns if it trains directly on the dataset
-`action` column.
+This is the layout used by `utils/xr_to_lerobot.py`. It is not the layout used
+by the current Psi0 10k/40k checkpoints, which were trained through Psi0's
+`HEPosttrainRepackTransform` path.
 
 ## Diffusion Policy Status
 
@@ -132,16 +133,26 @@ the model:
 --model.action-exec-horizon=30
 ```
 
-`RealRepackTransform` reads LeRobot keys `states`, `action`, and `task`, then
-pads/truncates them and normalizes from `meta/stats_psi0.json`. It does not slice
-the action down to `left_arm + left_hand`, and it does not reorder arm/hand
-blocks.
+The actual 10k/40k run config parses to `HEPosttrainRepackTransform`, not
+`RealRepackTransform`. For G1, `raw_he_to_psi0.py` writes
+`action.joint_angles` as:
+
+```python
+action = hand_joints + arm_joints
+```
+
+Then `HEPosttrainRepackTransform` keeps that order for G1 and constructs state
+as:
+
+```python
+states = observation.hand_joints + observation.arm_joints
+```
 
 So the current Psi0 training should be interpreted as:
 
 ```text
-input state:   full 63D
-output action: full 31D, in dataset action-column order
+input state:   full 63D, with first 28D = hands then arms
+output action: full 31D, with first 28D = hands then arms
 left-only:     only implied by the data distribution and deployment choice,
                not by a true 14D model head
 ```
@@ -152,39 +163,40 @@ deployment client decodes the 31D output using the same order as the dataset.
 ## Psi0 Deployment Status
 
 The local Psi0 RTC client now decodes the model output in
-`utils/psi0_rtc_bimanual_client.py` using the same arm-first order as the
-LeRobot training action column:
+`utils/psi0_rtc_bimanual_client.py` using the same hand-first order as the
+HEPosttrain G1 checkpoint:
 
 ```python
-arm = action[:14].copy()
-hand = action[14:28].copy()
+hand = action[:14].copy()
+arm = action[14:28].copy()
 ```
 
 That means deployment interprets the first 28 dimensions as:
 
 ```text
-0..6      left_arm[0:7]
-7..13     right_arm[0:7]
-14..20    left_hand[0:7]
-21..27    right_hand[0:7]
+0..6      left_hand[0:7]
+7..13     right_hand[0:7]
+14..20    left_arm[0:7]
+21..27    right_arm[0:7]
 28..30    ignored body / torso slots
 ```
 
 With `--arm-side left`, the client then executes:
 
 ```text
-left arm:  action[0:7]
-left hand: action[14:21]
+left arm:  action[14:21]
+left hand: action[0:7]
 right arm: held at previous target
 right hand: opened
 ```
 
-This matches the LeRobot training layout for the arm/hand blocks. The body slots
-remain ignored by the RTC client.
+This matches the HEPosttrain checkpoint layout for the arm/hand blocks. The body
+slots remain ignored by the RTC client.
 
 ## The Dangerous Mismatch
 
-If Psi0 trains directly on the LeRobot `action` column, the model learns:
+If this Psi0 checkpoint is decoded as the generic arm-first LeRobot layout, the
+client would read:
 
 ```text
 0..6      left_arm
@@ -194,7 +206,7 @@ If Psi0 trains directly on the LeRobot `action` column, the model learns:
 28..30    body
 ```
 
-The old RTC deployment client used to read:
+But the actual HEPosttrain G1 checkpoint was trained with:
 
 ```text
 0..6      left_hand
@@ -204,10 +216,11 @@ The old RTC deployment client used to read:
 28..30    body ignored
 ```
 
-This would swap arm and hand semantics at deployment. The model output intended
-for the left arm would be sent to the left hand path, and the model output
-intended for the left hand would be sent to the left arm path. That is much more
-dangerous than having unused right-side or body dimensions in a 31D output.
+Using arm-first decode for this checkpoint would swap arm and hand semantics at
+deployment. The model output intended for the left hand would be treated as left
+arm command, and the model output intended for the left arm would be treated as
+left hand command. That is much more dangerous than having unused right-side or
+body dimensions in a 31D output.
 
 This has now been fixed in the RTC client by changing only the deployment
 decode. The Psi0 model architecture and training dimensions remain unchanged.
@@ -233,8 +246,8 @@ left-only deployment path only executes left arm and left hand.
 ```
 
 Before running Psi0 on the real robot, still do a dry-run / UI preview check and
-verify that the printed left arm target changes correspond to action dimensions
-`0..6`, while the left hand target corresponds to dimensions `14..20`.
+verify that the printed left hand target changes correspond to action dimensions
+`0..6`, while the left arm target corresponds to dimensions `14..20`.
 
 ## Recommended Fix
 
@@ -249,18 +262,18 @@ ACTION_CHUNK_SIZE=30
 The chosen fix is to decode deployment actions using the training data layout:
 
 ```python
-left_arm = action[0:7]
-right_arm = action[7:14]
-left_hand = action[14:21]
-right_hand = action[21:28]
+left_hand = action[0:7]
+right_hand = action[7:14]
+left_arm = action[14:21]
+right_arm = action[21:28]
 body = action[28:31]  # ignored or handled separately
 ```
 
 For `--arm-side left`, execute:
 
 ```text
-left arm:  action[0:7]
-left hand: action[14:21]
+left arm:  action[14:21]
+left hand: action[0:7]
 right arm: previous target / hold
 right hand: open or current, depending on safety mode
 ```
@@ -275,9 +288,9 @@ slices the dataset action into `left_arm + left_hand` and an action head with
 Reason for the change:
 
 ```text
-Psi0 training consumes the LeRobot action column in arm-first order.
-The RTC client previously decoded model output in hand-first order.
-That mismatch could swap arm and hand commands on the robot.
+Psi0 10k/40k training uses HEPosttrain G1 action order: hands then arms.
+The RTC client briefly decoded model output in arm-first order.
+That mismatch could swap hand and arm commands on the robot.
 ```
 
 Changes made:
@@ -285,8 +298,7 @@ Changes made:
 ```text
 utils/psi0_rtc_bimanual_client.py
   Changed decode_policy_action():
-    old: hand = action[:14], arm = action[14:28]
-    new: arm = action[:14], hand = action[14:28]
+    correct: hand = action[:14], arm = action[14:28]
 
 docs/g1_bottle_dimension_alignment.md
   Recorded the data layout, DP fix, Psi0 risk analysis, selected fix, and

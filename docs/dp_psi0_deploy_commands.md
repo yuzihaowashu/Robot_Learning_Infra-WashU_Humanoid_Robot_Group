@@ -6,6 +6,25 @@ the G1 bottle task.
 Use this as the operator checklist. Terminal 1 runs the model server.
 Terminal 2 runs the robot-facing client and UI.
 
+## Robot Camera Stream
+
+After the robot reboots, the TeleImager camera server on the robot may not be
+running. Start/check it from this workstation before launching the DP or Psi0 UI:
+
+```bash
+cd /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group
+bash run_dp.sh camera
+```
+
+Expected stream endpoint:
+
+```text
+tcp://192.168.123.164:5555
+```
+
+If the UI shows blank/stale video, rerun this command in an interactive
+terminal and then refresh the browser UI.
+
 ## Diffusion Policy
 
 Diffusion Policy uses an HTTP server on port `8020` and a G1 client UI on
