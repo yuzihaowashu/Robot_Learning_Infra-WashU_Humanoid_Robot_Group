@@ -287,6 +287,114 @@ class PolicyChunk:
     action_8: np.ndarray | None = None
 
 
+@dataclass
+class InferenceStuckGuard:
+    last_signature: tuple[float, ...] | None = None
+    repeated_chunks: int = 0
+    low_motion_chunks: int = 0
+    inference_count: int = 0
+
+
+def get_stuck_guard(args: argparse.Namespace) -> InferenceStuckGuard:
+    ### New optimization logic: keep a lightweight runtime watchdog on the
+    ### argparse object so UI, continuous, and one-shot modes share repeated
+    ### chunk / low-motion state without changing the model checkpoint.
+    guard = getattr(args, "_stuck_guard", None)
+    if guard is None:
+        guard = InferenceStuckGuard()
+        setattr(args, "_stuck_guard", guard)
+    return guard
+
+
+def policy_chunk_signature(
+    chunk: PolicyChunk,
+    exec_steps: int,
+    decimals: int,
+) -> tuple[float, ...]:
+    ### New optimization logic: quantized signatures detect repeated
+    ### diffusion samples that can make the robot appear stuck even while
+    ### inference is returning valid chunks.
+    if chunk.mode == "eef":
+        assert chunk.action_8 is not None
+        data = chunk.action_8[:exec_steps, [0, 1, 2, 7]]
+    else:
+        assert chunk.action_31 is not None
+        data = chunk.action_31[:exec_steps, np.r_[0:7, 14:21]]
+    return tuple(np.round(data.reshape(-1), decimals=decimals).tolist())
+
+
+def policy_chunk_motion(chunk: PolicyChunk, exec_steps: int) -> float:
+    ### New optimization logic: measure planned chunk progress before
+    ### execution so the client can warn or reset history on no-progress
+    ### outputs instead of blindly sending another near-identical command.
+    if exec_steps <= 0:
+        return 0.0
+    if chunk.mode == "eef":
+        assert chunk.action_8 is not None
+        xyz = chunk.action_8[:exec_steps, :3]
+        if len(xyz) <= 1:
+            return 0.0
+        return float(np.linalg.norm(xyz[-1] - xyz[0]))
+    assert chunk.action_31 is not None
+    left_arm = chunk.action_31[:exec_steps, :7]
+    if len(left_arm) <= 1:
+        return 0.0
+    return float(np.linalg.norm(left_arm[-1] - left_arm[0]))
+
+
+def update_stuck_guard(
+    args: argparse.Namespace,
+    chunk: PolicyChunk,
+    exec_steps: int,
+) -> dict[str, Any]:
+    ### New optimization logic: classify the current policy output as
+    ### repeated/low-progress, and optionally request a model-history reset.
+    guard = get_stuck_guard(args)
+    guard.inference_count += 1
+    signature = policy_chunk_signature(
+        chunk,
+        exec_steps=exec_steps,
+        decimals=int(args.stuck_signature_decimals),
+    )
+    if signature == guard.last_signature:
+        guard.repeated_chunks += 1
+    else:
+        guard.repeated_chunks = 0
+    guard.last_signature = signature
+
+    motion = policy_chunk_motion(chunk, exec_steps)
+    motion_eps = (
+        args.stuck_eef_motion_eps
+        if chunk.mode == "eef"
+        else args.stuck_joint_motion_eps
+    )
+    if motion <= motion_eps:
+        guard.low_motion_chunks += 1
+    else:
+        guard.low_motion_chunks = 0
+
+    periodic_reset = (
+        args.reset_history_every > 0
+        and guard.inference_count > 1
+        and guard.inference_count % args.reset_history_every == 0
+    )
+    repeated = guard.repeated_chunks >= args.stuck_repeat_limit
+    low_motion = guard.low_motion_chunks >= args.stuck_low_motion_limit
+    triggered = bool(args.stuck_watchdog and (repeated or low_motion))
+    return {
+        "enabled": bool(args.stuck_watchdog),
+        "triggered": triggered,
+        "periodic_reset": periodic_reset,
+        "repeated": repeated,
+        "low_motion": low_motion,
+        "repeated_chunks": guard.repeated_chunks,
+        "low_motion_chunks": guard.low_motion_chunks,
+        "planned_motion": motion,
+        "motion_eps": float(motion_eps),
+        "inference_count": guard.inference_count,
+    }
+
+
 def state_index_name(index: int) -> str:
     if 0 <= index <= 6:
         return f"left_arm[{index}]"
@@ -979,6 +1087,41 @@ def run_single_policy_step(
     if chunk.mode == "eef":
         assert chunk.action_8 is not None
         print_eef_chunk_summary(chunk.action_8, exec_steps)
+    guard_result = update_stuck_guard(args, chunk, exec_steps)
+    if guard_result["periodic_reset"]:
+        print(
+            "  ### New optimization logic: periodic observation-history "
+            f"reset after {guard_result['inference_count']} inferences."
+        )
+        reset_policy_history(args.server_url, args.timeout)
+    if guard_result["enabled"]:
+        print(
+            "  ### New optimization logic: stuck watchdog "
+            f"motion={guard_result['planned_motion']:.5f}, "
+            f"repeat={guard_result['repeated_chunks']}, "
+            f"low_motion={guard_result['low_motion_chunks']}"
+        )
+    if guard_result["triggered"]:
+        print(
+            "  ### New optimization logic: stuck watchdog triggered "
+            f"(repeated={guard_result['repeated']}, "
+            f"low_motion={guard_result['low_motion']})."
+        )
+        if args.auto_reset_on_stuck:
+            reset_policy_history(args.server_url, args.timeout)
+            return {
+                "step": step_idx,
+                "mode": "execute" if args.execute else "dry-run",
+                "policy_output": args.policy_output,
+                "chunk_len": chunk_len,
+                "exec_steps": 0,
+                "stopped": True,
+                "stuck_guard": guard_result,
+                "message": (
+                    "stuck watchdog reset model history; skipped this chunk"
+                ),
+                "steps": [],
+            }
     step_results = []
     stopped = False
     left_hand_prev = state["left_hand"].copy()
@@ -1206,6 +1349,7 @@ def run_single_policy_step(
         "chunk_len": chunk_len,
         "exec_steps": len(step_results),
         "stopped": stopped,
+        "stuck_guard": guard_result,
         "steps": step_results,
     }
 
@@ -1729,6 +1873,78 @@ def parse_args() -> argparse.Namespace:
         help="Number of predicted chunk steps to execute per UI click/approval.",
     )
     parser.add_argument(
+        "--stuck-watchdog",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "### New optimization logic: detect repeated or low-motion "
+            "policy chunks at inference time. Use --no-stuck-watchdog to "
+            "disable."
+        ),
+    )
+    parser.add_argument(
+        "--auto-reset-on-stuck",
+        action="store_true",
+        help=(
+            "### New optimization logic: when the stuck watchdog triggers, "
+            "reset server observation history and skip executing that chunk."
+        ),
+    )
+    parser.add_argument(
+        "--stuck-repeat-limit",
+        type=int,
+        default=3,
+        help=(
+            "### New optimization logic: number of repeated quantized chunks "
+            "before the watchdog triggers."
+        ),
+    )
+    parser.add_argument(
+        "--stuck-low-motion-limit",
+        type=int,
+        default=3,
+        help=(
+            "### New optimization logic: number of low-motion chunks before "
+            "the watchdog triggers."
+        ),
+    )
+    parser.add_argument(
+        "--stuck-eef-motion-eps",
+        type=float,
+        default=0.005,
+        help=(
+            "### New optimization logic: EEF chunk xyz-span threshold in "
+            "meters for low-motion detection."
+        ),
+    )
+    parser.add_argument(
+        "--stuck-joint-motion-eps",
+        type=float,
+        default=0.01,
+        help=(
+            "### New optimization logic: joint chunk left-arm span threshold "
+            "in radians for low-motion detection."
+        ),
+    )
+    parser.add_argument(
+        "--stuck-signature-decimals",
+        type=int,
+        default=3,
+        help=(
+            "### New optimization logic: decimal precision for repeated-chunk "
+            "signatures."
+        ),
+    )
+    parser.add_argument(
+        "--reset-history-every",
+        type=int,
+        default=0,
+        help=(
+            "### New optimization logic: optional periodic server history "
+            "reset every N policy inferences; 0 disables."
+        ),
+    )
+    parser.add_argument(
         "--action-mode",
         choices=("absolute", "delta"),
         default="absolute",
@@ -1796,6 +2012,14 @@ def main() -> None:
     args = parse_args()
     if args.mock and args.execute:
         raise SystemExit("--mock cannot be combined with --execute")
+    ### New optimization logic: fail fast on invalid watchdog settings so
+    ### stuck-recovery behavior is predictable during real-robot tests.
+    if args.stuck_repeat_limit < 1:
+        raise SystemExit("--stuck-repeat-limit must be >= 1")
+    if args.stuck_low_motion_limit < 1:
+        raise SystemExit("--stuck-low-motion-limit must be >= 1")
+    if args.reset_history_every < 0:
+        raise SystemExit("--reset-history-every must be >= 0")
 
     if args.policy_output == "eef":
         from g1_wrist_ik import get_left_wrist_kinematics
@@ -1922,6 +2146,35 @@ def main() -> None:
             if chunk.mode == "eef":
                 assert chunk.action_8 is not None
                 print_eef_chunk_summary(chunk.action_8, exec_steps_preview)
+            guard_result = update_stuck_guard(args, chunk, exec_steps_preview)
+            if guard_result["periodic_reset"]:
+                print(
+                    "  ### New optimization logic: periodic observation-history "
+                    f"reset after {guard_result['inference_count']} inferences."
+                )
+                reset_policy_history(args.server_url, args.timeout)
+            if guard_result["enabled"]:
+                print(
+                    "  ### New optimization logic: stuck watchdog "
+                    f"motion={guard_result['planned_motion']:.5f}, "
+                    f"repeat={guard_result['repeated_chunks']}, "
+                    f"low_motion={guard_result['low_motion_chunks']}"
+                )
+            if guard_result["triggered"]:
+                print(
+                    "  ### New optimization logic: stuck watchdog triggered "
+                    f"(repeated={guard_result['repeated']}, "
+                    f"low_motion={guard_result['low_motion']})."
+                )
+                if args.auto_reset_on_stuck:
+                    reset_policy_history(args.server_url, args.timeout)
+                    print(
+                        "  ### New optimization logic: model history reset; "
+                        "skipping this chunk."
+                    )
+                    if args.once:
+                        return
+                    continue
             left_hand_prev = state["left_hand"].copy()
             left_arm_prev = state["left_arm"].copy()
             for local_idx in range(n_steps):

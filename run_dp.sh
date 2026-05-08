@@ -56,6 +56,8 @@ Common options:
     --host HOST
     --port PORT
     --device DEVICE
+    --sampler ddpm/ddim
+    --num-inference-steps N
 
   client:
     --server-url URL
@@ -68,6 +70,9 @@ Common options:
     --continuous
     --step-seconds SEC
     --action-exec-steps N  Chunk prefix to execute per UI click/approval
+    --stuck-watchdog / --no-stuck-watchdog
+    --auto-reset-on-stuck
+    --reset-history-every N
     --action-mode MODE arm absolute/delta, default: absolute
     --hand-action-mode MODE auto/absolute/delta, default: auto
     --max-hand-delta VALUE  Finger clamp for --hand-mode policy, default: 0.6; 0 disables

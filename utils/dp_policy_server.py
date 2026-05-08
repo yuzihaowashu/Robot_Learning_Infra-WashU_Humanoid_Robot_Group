@@ -119,6 +119,37 @@ def build_policy_state(payload: dict[str, Any], state_dim: int) -> np.ndarray:
     return state
 
 
+def configure_policy_inference(
+    policy: Any,
+    sampler: str,
+    num_inference_steps: int | None,
+) -> tuple[str, int | None]:
+    ### New optimization logic: allow sampler/step-count overrides at
+    ### inference time so robot deployment can reduce latency or switch to
+    ### deterministic DDIM without retraining the checkpoint.
+    if sampler == "ddim":
+        try:
+            from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+        except Exception as exc:
+            raise RuntimeError(
+                "DDIM sampler requested, but diffusers DDIMScheduler "
+                f"could not be imported: {exc}"
+            ) from exc
+        policy.noise_scheduler = DDIMScheduler.from_config(
+            policy.noise_scheduler.config
+        )
+    elif sampler != "ddpm":
+        raise ValueError(f"Unsupported sampler: {sampler}")
+
+    if num_inference_steps is not None:
+        if num_inference_steps <= 0:
+            raise ValueError("--num-inference-steps must be positive")
+        policy.num_inference_steps = int(num_inference_steps)
+
+    scheduler_name = type(policy.noise_scheduler).__name__
+    return scheduler_name, getattr(policy, "num_inference_steps", None)
+
+
 class DPPolicyServer:
     def __init__(
         self,
@@ -126,6 +157,8 @@ class DPPolicyServer:
         device: str,
         image_size: int,
         obs_horizon: int,
+        sampler: str,
+        num_inference_steps: int | None,
     ):
         module = importlib.import_module(
             "diffusion_policy.workspace.train_diffusion_unet_image_workspace"
@@ -139,6 +172,11 @@ class DPPolicyServer:
         workspace = workspace_cls.create_from_checkpoint(str(checkpoint))
         use_ema = bool(getattr(workspace.cfg.training, "use_ema", False))
         self.policy = workspace.ema_model if use_ema else workspace.model
+        scheduler_name, inference_steps = configure_policy_inference(
+            self.policy,
+            sampler=sampler,
+            num_inference_steps=num_inference_steps,
+        )
         self.policy.to(self.device)
         self.policy.eval()
         shape_meta = cfg_get(workspace.cfg, "shape_meta") or cfg_get(
@@ -163,7 +201,8 @@ class DPPolicyServer:
             "[DP] Ready. "
             f"use_ema={use_ema}, obs_horizon={obs_horizon}, "
             f"device={self.device}, state_dim={self.policy_state_dim}, "
-            f"action_dim={self.policy_action_dim}"
+            f"action_dim={self.policy_action_dim}, "
+            f"scheduler={scheduler_name}, inference_steps={inference_steps}"
         )
 
     def reset(self) -> dict[str, Any]:
@@ -236,6 +275,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=84)
     parser.add_argument("--obs-horizon", type=int, default=2)
     parser.add_argument(
+        "--sampler",
+        choices=("ddpm", "ddim"),
+        default="ddpm",
+        help=(
+            "Inference sampler override. ddpm preserves checkpoint behavior; "
+            "ddim uses deterministic DDIM sampling without retraining."
+        ),
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override policy.num_inference_steps at inference time. Useful "
+            "for faster robot iteration; leave unset to use checkpoint config."
+        ),
+    )
+    parser.add_argument(
         "--load-only",
         action="store_true",
         help="Load the checkpoint and exit without starting HTTP service.",
@@ -257,6 +314,8 @@ def main() -> None:
         device=args.device,
         image_size=args.image_size,
         obs_horizon=args.obs_horizon,
+        sampler=args.sampler,
+        num_inference_steps=args.num_inference_steps,
     )
     if args.load_only:
         print("[DP] Checkpoint load-only validation succeeded.")
