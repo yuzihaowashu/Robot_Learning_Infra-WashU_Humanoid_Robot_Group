@@ -8,8 +8,10 @@ Terminal 2 runs the robot-facing client and UI.
 
 ## Robot Camera Stream
 
-After the robot reboots, the TeleImager camera server on the robot may not be
-running. Start/check it from this workstation before launching the DP or Psi0 UI:
+After the robot reboots, the camera server on the robot may not be running.
+Start/check it from this workstation before launching the DP or Psi0 UI.
+See also [Before Terminal 1: Robot camera stream](#before-terminal-1-robot-camera-stream)
+under Psi0 RTC.
 
 ```bash
 cd /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group
@@ -96,6 +98,26 @@ The local 10k checkpoint path is:
 
 Only `model.safetensors` was downloaded. Optimizer, scheduler, and random
 state files were intentionally not downloaded.
+
+### Before Terminal 1: Robot camera stream
+
+After a robot reboot, the head camera is usually off. Start it **before** the
+Psi0 server and client. The Psi0 UI reads from ZMQ port `5555` on the robot
+(not the XR `teleimager-server` stream on `55555`).
+
+```bash
+cd /home/humanoid-pc/yu.zihao/Robot_Learning_Infra-WashU_Humanoid_Robot_Group
+bash run_dp.sh camera
+```
+
+Expected stream endpoint:
+
+```text
+tcp://192.168.123.164:5555
+```
+
+If the UI at `http://127.0.0.1:8040` shows blank video, rerun this command
+in an interactive terminal, then refresh the browser.
 
 ### Terminal 1: Psi0 10k RTC Server
 

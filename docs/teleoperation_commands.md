@@ -79,6 +79,10 @@ After Launch Teleop, open the full URL shown in Gradio on the PICO browser:
 
 Click `Enter VR` to enter immersive mode.
 
+## Special Attention: Purple Button on the right joystick. 
+# Remember to press it twice to re-localize the VR to make sure the direction aligns. 
+
+
 If the page opens but cannot enter VR, accept/trust the HTTPS certificate on PICO, or regenerate the certificate with the current WiFi IP.
 
 ### Step 5: Control and Recording
