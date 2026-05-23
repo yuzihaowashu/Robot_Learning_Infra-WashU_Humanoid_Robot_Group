@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 
 import numpy as np
@@ -63,6 +64,14 @@ def _hand_motor_mode(motor_id, status=0x01, timeout=0):
             | ((timeout & 0x01) << 7))
 CONTROL_DT = 0.02
 MOVE_TO_START_DURATION = 3.0
+
+# Match teach_poses / dex3_close_hands
+OPEN_HAND_Q = [0.0] * N_HAND_MOTORS_PER_HAND
+CLOSED_LEFT_HAND_Q = [0.0, 1.0, 1.74, -1.57, -1.74, -1.57, -1.74]
+CLOSED_RIGHT_HAND_Q = [0.0, -1.0, -1.74, 1.57, 1.74, 1.57, 1.74]
+PREPARE_CLOSE_HANDS_SEC = 0.5
+CLOSE_HAND_KP = 0.4
+CLOSE_HAND_KD = 0.15
 
 URDF_PATH = (
     "/home/humanoid-pc/unitree_rl_gym/resources/robots/"
@@ -150,6 +159,14 @@ class TrajectoryPlayer:
         self.state_received = False
         self.crc = CRC()
         self._stop = False
+        self._recorder = None
+        self._owns_channels = False
+
+    def _low_state(self):
+        """Robot state from own subscriber or attached TeachRecorder."""
+        if self._recorder is not None:
+            return self._recorder.low_state
+        return self.low_state
 
     def _parse_frames(self):
         for f in self.raw_frames:
@@ -201,7 +218,18 @@ class TrajectoryPlayer:
                 return lerp_frame(f0, f1, a)
         return self.hand_traj[-1][1]
 
-    def init(self):
+    def init(self, recorder=None):
+        """Init DDS channels, or reuse an existing TeachRecorder session."""
+        if recorder is not None:
+            self._recorder = recorder
+            self.arm_sdk_pub = recorder.arm_sdk_pub
+            self.left_hand_pub = recorder.left_hand_pub
+            self.right_hand_pub = recorder.right_hand_pub
+            self._owns_channels = False
+            print("Replay: using existing teach session DDS channels")
+            return
+
+        self._owns_channels = True
         self.arm_sdk_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
         self.arm_sdk_pub.Init()
         self.lowstate_sub = ChannelSubscriber(
@@ -240,6 +268,8 @@ class TrajectoryPlayer:
         self.hand_state = msg
 
     def wait_for_state(self, timeout=5.0):
+        if self._recorder is not None:
+            return self._recorder.wait_for_state(timeout)
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self.state_received:
@@ -248,21 +278,26 @@ class TrajectoryPlayer:
         return False
 
     def _get_current_arm_pos(self):
+        ls = self._low_state()
+        if ls is None:
+            return {j: 0.0 for j in ARM_JOINTS}
         pos = {}
         for j in ARM_JOINTS:
-            pos[j] = float(
-                self.low_state.motor_state[j].q
-            )
+            pos[j] = float(ls.motor_state[j].q)
         return pos
 
     def _send_arm_cmd(self, positions, weight=1.0):
         """Publish arm_sdk command with gravity-compensated arm positions."""
+        ls = self._low_state()
+        if ls is None:
+            return
+
         cmd = unitree_hg_msg_dds__LowCmd_()
         cmd.motor_cmd[ARM_SDK_ENABLE_IDX].q = weight
 
         grav = {}
-        if self.grav_comp and self.low_state:
-            grav = self.grav_comp.compute(self.low_state)
+        if self.grav_comp and ls:
+            grav = self.grav_comp.compute(ls)
 
         for j in ARM_JOINTS:
             cmd.motor_cmd[j].mode = 1
@@ -277,7 +312,7 @@ class TrajectoryPlayer:
         for j in WAIST_JOINTS:
             cmd.motor_cmd[j].mode = 1
             cmd.motor_cmd[j].q = float(
-                self.low_state.motor_state[j].q
+                ls.motor_state[j].q
             )
             cmd.motor_cmd[j].dq = 0.0
             cmd.motor_cmd[j].tau = grav.get(j, 0.0)
@@ -333,36 +368,82 @@ class TrajectoryPlayer:
             time.sleep(CONTROL_DT)
         print("Hands released.")
 
+    @staticmethod
+    def _lerp_hand_q(q0, q1, alpha):
+        return [q0[i] + (q1[i] - q0[i]) * alpha for i in range(N_HAND_MOTORS_PER_HAND)]
+
+    def _send_dual_hand_cmds(self, left_q, right_q, kp, kd):
+        self.left_hand_pub.Write(
+            self._build_hand_cmd(left_q, kp=kp, kd=kd)
+        )
+        self.right_hand_pub.Write(
+            self._build_hand_cmd(right_q, kp=kp, kd=kd)
+        )
+
+    def _close_hands(self, duration=PREPARE_CLOSE_HANDS_SEC):
+        if not self.has_hands:
+            return
+        print("  Closing fingers...")
+        steps = max(1, int(duration / CONTROL_DT))
+        for i in range(steps):
+            ratio = smooth_ratio((i + 1) / steps)
+            left = self._lerp_hand_q(OPEN_HAND_Q, CLOSED_LEFT_HAND_Q, ratio)
+            right = self._lerp_hand_q(OPEN_HAND_Q, CLOSED_RIGHT_HAND_Q, ratio)
+            self._send_dual_hand_cmds(
+                left, right,
+                kp=CLOSE_HAND_KP * ratio,
+                kd=CLOSE_HAND_KD,
+            )
+            time.sleep(CONTROL_DT)
+        self._send_dual_hand_cmds(
+            CLOSED_LEFT_HAND_Q, CLOSED_RIGHT_HAND_Q,
+            kp=CLOSE_HAND_KP, kd=CLOSE_HAND_KD,
+        )
+
+    def _hand_targets_from_dict(self, hand_pos):
+        if hand_pos is None:
+            return list(OPEN_HAND_Q), list(OPEN_HAND_Q)
+        left = [hand_pos.get(i, 0.0) for i in range(N_HAND_MOTORS_PER_HAND)]
+        right = [
+            hand_pos.get(i + 7, 0.0) for i in range(N_HAND_MOTORS_PER_HAND)
+        ]
+        return left, right
+
     def _send_hand_cmd(self, positions, kp_scale=1.0):
         if positions is None:
             return
-        # Split into left (keys 0-6) and right (keys 7-13)
-        left_q = [positions.get(i, 0.0)
-                  for i in range(N_HAND_MOTORS_PER_HAND)]
-        right_q = [positions.get(i + 7, 0.0)
-                   for i in range(N_HAND_MOTORS_PER_HAND)]
-        lcmd = self._build_hand_cmd(
-            left_q, kp=KP_HAND * kp_scale,
-            kd=KD_HAND * kp_scale
+        left_q, right_q = self._hand_targets_from_dict(positions)
+        self._send_dual_hand_cmds(
+            left_q, right_q,
+            kp=KP_HAND * kp_scale,
+            kd=KD_HAND * kp_scale,
         )
-        rcmd = self._build_hand_cmd(
-            right_q, kp=KP_HAND * kp_scale,
-            kd=KD_HAND * kp_scale
-        )
-        self.left_hand_pub.Write(lcmd)
-        self.right_hand_pub.Write(rcmd)
+
+    def request_stop(self):
+        """Stop playback (safe from Gradio / worker threads)."""
+        self._stop = True
 
     def play(self):
-        signal.signal(
-            signal.SIGINT,
-            lambda s, f: setattr(self, '_stop', True)
-        )
+        self._stop = False
+        # Gradio invokes callbacks off the main thread; signal only works there.
+        if threading.current_thread() is threading.main_thread():
+            try:
+                signal.signal(
+                    signal.SIGINT,
+                    lambda s, f: setattr(self, '_stop', True),
+                )
+            except ValueError:
+                pass
 
         current_arm = self._get_current_arm_pos()
         target_arm = self.arm_traj[0][1]
         target_hand = self._sample_hand(0.0)
+        end_left, end_right = self._hand_targets_from_dict(target_hand)
 
-        # Phase 1: Enable arm_sdk with ramping weight
+        if self.has_hands:
+            self._close_hands()
+
+        # Phase 1: Enable arm_sdk with ramping weight (fingers stay closed)
         print("\nEngaging arm control...")
         steps = int(2.0 / CONTROL_DT)
         for i in range(steps):
@@ -370,10 +451,15 @@ class TrajectoryPlayer:
                 return
             w = smooth_ratio(i / steps)
             self._send_arm_cmd(current_arm, weight=w)
+            if self.has_hands:
+                self._send_dual_hand_cmds(
+                    CLOSED_LEFT_HAND_Q, CLOSED_RIGHT_HAND_Q,
+                    kp=CLOSE_HAND_KP, kd=CLOSE_HAND_KD,
+                )
             time.sleep(CONTROL_DT)
 
-        # Phase 2: Move to recorded start position
-        print("Moving to start position...")
+        # Phase 2: Move to start; open fingers closed -> target while moving
+        print("Moving to start (opening hands)...")
         steps = int(MOVE_TO_START_DURATION / CONTROL_DT)
         for i in range(steps):
             if self._stop:
@@ -381,8 +467,14 @@ class TrajectoryPlayer:
             s = smooth_ratio(i / steps)
             blended = lerp_frame(current_arm, target_arm, s)
             self._send_arm_cmd(blended)
-            if target_hand is not None:
-                self._send_hand_cmd(target_hand, kp_scale=s)
+            if self.has_hands:
+                left = self._lerp_hand_q(CLOSED_LEFT_HAND_Q, end_left, s)
+                right = self._lerp_hand_q(CLOSED_RIGHT_HAND_Q, end_right, s)
+                self._send_dual_hand_cmds(
+                    left, right,
+                    kp=KP_HAND * max(s, 0.15),
+                    kd=KD_HAND,
+                )
             time.sleep(CONTROL_DT)
 
         # Phase 3: Play trajectory
@@ -429,7 +521,7 @@ class TrajectoryPlayer:
         print("Replay complete!")
 
 
-def ensure_ai_mode():
+def ensure_ai_mode(interactive=True):
     """Check that the locomotion controller (ai sport) is active."""
     msc = MotionSwitcherClient()
     msc.SetTimeout(5.0)
@@ -474,6 +566,9 @@ def ensure_ai_mode():
     print("\nIf in debug mode (L2+R2), reboot the robot.")
     print("")
 
+    if not interactive:
+        print("Aborting (non-interactive mode).")
+        return False
     ans = input("Continue anyway? (y/N): ").strip().lower()
     return ans == "y"
 

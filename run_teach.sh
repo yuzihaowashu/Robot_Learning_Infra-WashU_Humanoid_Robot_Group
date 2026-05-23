@@ -8,6 +8,8 @@
 #    bash run_teach.sh replay <file>    # replay a trajectory
 #    bash run_teach.sh replay <file> --speed 0.5 --loop 3
 #    bash run_teach.sh list             # list saved trajectories
+#    bash run_teach_ui.sh               # Gradio UI (name + select replay)
+#    bash run_teach.sh record -n "pick cup"   # named trajectory (CLI)
 # =============================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +54,13 @@ case "$MODE" in
     list)
         echo "Saved trajectories:"
         echo ""
-        ls -lt "${TRAJ_DIR}"/*.json 2>/dev/null | while read line; do
+        python3 -c "
+import sys
+sys.path.insert(0, '${UTILS_DIR}')
+from teach_catalog import list_trajectories, format_choice_label
+for e in list_trajectories('${TRAJ_DIR}'):
+    print(f\"  {format_choice_label(e)}  ->  {e['file']}\")
+" 2>/dev/null || ls -lt "${TRAJ_DIR}"/*.json 2>/dev/null | while read line; do
             file=$(echo "$line" | awk '{print $NF}')
             if [ -f "$file" ]; then
                 frames=$(python3 -c "import json; d=json.load(open('$file')); m=d['metadata']; print(f\"{m['n_frames']} frames, {m['duration_s']}s\")" 2>/dev/null)
