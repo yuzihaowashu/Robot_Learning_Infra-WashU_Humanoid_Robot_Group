@@ -79,9 +79,27 @@ After Launch Teleop, open the full URL shown in Gradio on the PICO browser:
 
 Click `Enter VR` to enter immersive mode.
 
-## Special Attention: Purple Button on the right joystick. 
-# Remember to press it twice to re-localize the VR to make sure the direction aligns. 
+#### VR Re-localization: Purple Button (PICO 4U Enterprise)
 
+> [!IMPORTANT]
+> On **PICO 4U Enterprise**, the **purple button** on the **right controller** re-sets the tracked **position** and **orientation** of the wearer in the VR workspace (where the teleop browser view thinks you are standing and which way you are facing).
+>
+> **Common failure mode**
+>
+> 1. You put on the headset while standing **behind the robot** (your back toward the robot) and **facing the desktop monitor**.
+> 2. The system centers your pose at that moment and treats **facing the monitor** as the default forward direction.
+> 3. You then turn around to face the experiment area (your back toward the monitor, aligned with the robot) and start teleoperation.
+> 4. Because the stored default forward is **opposite** your real orientation, **both robot arms can suddenly jerk backward** when tracking starts—the VR frame no longer matches the physical workspace.
+>
+> **Required workflow (before teleoperation)**
+>
+> After wearing the headset and entering VR, but **before** pressing Left X to start tracking:
+>
+> 1. Stand in the pose and location where you will actually operate (facing the robot and experiment space).
+> 2. **Press the purple button twice** on the right controller.
+> 3. Confirm the browser/VR view is centered and that your position and facing direction match where you are in the room.
+>
+> Only then proceed to Step 5.
 
 If the page opens but cannot enter VR, accept/trust the HTTPS certificate on PICO, or regenerate the certificate with the current WiFi IP.
 
@@ -91,6 +109,7 @@ Recommended single-person workflow:
 
 - PC: click `(1) Launch Teleop`.
 - PICO: wear headset, open the 8012 URL, and click `Enter VR`.
+- PICO: stand in the final operating pose, then **press the right-controller purple button twice** to re-localize position and orientation (see Step 4).
 - VR Left X: start/resume tracking, recalibrate controller pose, and start a new episode.
 - VR Left Y: mark the splitter transition and toggle `forward` / `backward`.
 - VR Right A: stop and save the current episode.
@@ -230,7 +249,7 @@ python teleop_hand_and_arm.py \
 
 **Launch Teleop exits quickly:** Check Gradio Output or `teleop_latest.log`. Common causes: PC2 teleimager not running, bad camera config, wrong DDS network interface.
 
-**Arm jumps backward/sideways:** Usually caused by a one-frame PICO/OpenXR controller pose jump or relocalization. The code pauses tracking for wrist target jumps above 0.15 m. Move your hands back to a safe pose and press Left X to recalibrate/resume.
+**Arm jumps backward/sideways:** Often caused by skipping VR re-localization (see Step 4 purple button): if you first faced the monitor, then turned to face the robot, the default VR forward can be reversed and both arms jerk backward when tracking starts. Fix: stop tracking, stand in your real operating pose, press the purple button twice, then press Left X again. It can also be a one-frame PICO/OpenXR controller pose jump; the code pauses tracking for wrist target jumps above 0.15 m. Move your hands back to a safe pose and press Left X to recalibrate/resume.
 
 **Arm drops when pressing Left X:** The first IK target may be far from the robot's current safe spread pose. `--teleop-start-ramp-sec` smooths this transition. Default: 2.5 s. Before pressing Left X, keep your hands above table height.
 
@@ -318,6 +337,28 @@ Launch Teleop 后，在 PICO 浏览器打开 Gradio 显示的完整 URL:
 
 点击 `Enter VR` 进入沉浸模式。
 
+#### VR 重定位：紫色按键（PICO 4U Enterprise）
+
+> [!IMPORTANT]
+> 在 **PICO 4U Enterprise** 上，**右手柄的紫色按键** 用于重设佩戴者在 VR 空间中的**位置**和**朝向**（系统认为你站在哪里、面向哪里）。
+>
+> **常见错误场景**
+>
+> 1. 戴上头显时站在**机器人后方**（背对机器人），**面向桌面显示器**。
+> 2. 此时系统会以该姿态为原点，并把**面向显示器**当作默认正前方。
+> 3. 随后转身面向实验区域（背对显示器、与机器人同向）并开始遥操作。
+> 4. 由于记录的正前方与真实朝向**相反**，开始 tracking 时**双臂可能突然向后猛拽**——VR 坐标系与真实工位不一致。
+>
+> **开始遥操作前必须执行**
+>
+> 戴上头显并进入 VR 后，在按 Left X 开始 tracking **之前**：
+>
+> 1. 站到你实际要操作的站位和朝向（面向机器人和实验区域）。
+> 2. **连按右手柄紫色按键两次**。
+> 3. 确认浏览器/VR 画面已居中，且位置与朝向与你在房间中的真实姿态一致。
+>
+> 然后再进入第 5 步。
+
 如果页面能打开但不能进入 VR，先在 PICO 上接受/信任 HTTPS 证书，或者用当前 WiFi IP 重新生成证书。
 
 ### 第 5 步: 控制和录制
@@ -326,6 +367,7 @@ Launch Teleop 后，在 PICO 浏览器打开 Gradio 显示的完整 URL:
 
 - PC: 点击 `(1) Launch Teleop`。
 - PICO: 戴上头显，打开 8012 URL，点击 `Enter VR`。
+- PICO: 站到最终操作站位后，**连按右手柄紫色按键两次**完成位置与朝向重定位（见第 4 步）。
 - VR Left X: 开始/恢复 tracking，重新校准 controller pose，并开始新 episode。
 - VR Left Y: 标记 splitter transition，并在 `forward` / `backward` 之间切换。
 - VR Right A: 停止并保存当前 episode。
@@ -465,7 +507,7 @@ python teleop_hand_and_arm.py \
 
 **Launch Teleop 后很快退出:** 查看 Gradio Output 或 `teleop_latest.log`。常见原因: PC2 teleimager 未启动、相机配置异常、DDS 网络接口不对。
 
-**手臂突然向后或侧向跳:** 通常是 PICO/OpenXR controller pose 单帧跳变或重定位。当前代码会在 wrist target 跳变超过 0.15 m 时暂停 tracking。把手放回安全位置，再按 Left X 重新校准/恢复。
+**手臂突然向后或侧向跳:** 常见原因是未做 VR 重定位（见第 4 步紫色按键）：若先面向显示器再转身面向机器人，默认 VR 正前方可能相反，开始 tracking 时双臂会向后猛拽。处理：停止 tracking，站到真实操作姿态，连按紫色按键两次，再按 Left X。也可能是 PICO/OpenXR controller pose 单帧跳变；代码会在 wrist target 跳变超过 0.15 m 时暂停 tracking。把手放回安全位置，再按 Left X 重新校准/恢复。
 
 **按 Left X 开始时手臂突然下落:** 第一帧 IK target 可能离机器人当前安全外展位很远。`--teleop-start-ramp-sec` 会平滑这个过渡。默认: 2.5 s。按 Left X 前，建议把双手抬到桌面上方安全高度。
 
