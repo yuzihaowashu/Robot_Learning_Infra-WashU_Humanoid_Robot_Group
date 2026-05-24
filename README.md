@@ -10,6 +10,7 @@ and run Vision-Language-Action (VLA) inference via NVIDIA GR00T N1.6.
 | **VLA Inference** — GR00T N1.6 zero-shot control | `bash run_vla.sh` | [docs/vla_inference.md](docs/vla_inference.md) |
 | **Data Collection** — Record LeRobot datasets from demos | `bash run_collect.sh` | [docs/data_collection.md](docs/data_collection.md) |
 | **Drag-and-Teach** — Record & replay arm trajectories | `bash run_teach.sh` | [docs/teach_and_replay.md](docs/teach_and_replay.md) |
+| **Drag-and-Teach UI** — Goals & steps (Gradio) | `bash run_teach_ui.sh` | [TEACH_UI.md](TEACH_UI.md) |
 | **VR Teleoperation** — PICO 4 Ultra VR → upper body control | `bash run_teleop.sh` | [docs/teleoperation.md](docs/teleoperation.md) |
 | **Dashboard** — Real-time GUI with camera, joints, tactile | `bash run_dashboard.sh` | [docs/dashboard.md](docs/dashboard.md) |
 | **Tactile Sensors** — Dex3 pressure sensor visualization | Integrated in dashboard | [docs/tactile_sensors.md](docs/tactile_sensors.md) |
@@ -37,6 +38,8 @@ Step-by-step mode shows each action's target angles in degrees and waits
 for your approval before execution. See [VLA docs](docs/vla_inference.md).
 
 ### 2. Drag-and-Teach + Data Collection
+
+**Web UI (goals & steps):** `bash run_teach_ui.sh` → http://localhost:7861 — see [TEACH_UI.md](TEACH_UI.md).
 
 ```bash
 # Step 1: Record trajectories by physically moving the arms
