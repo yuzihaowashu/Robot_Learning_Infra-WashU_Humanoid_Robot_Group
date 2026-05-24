@@ -47,8 +47,9 @@ WAIST_JOINTS = [12, 13, 14]
 ARM_SDK_JOINTS = WAIST_JOINTS + ARM_JOINTS
 ARM_SDK_ENABLE_IDX = 29
 
-KP_ARM = 80.0
-KD_ARM = 2.0
+# Match teach hold gains — high kp (80) caused violent oscillation on replay.
+KP_ARM = 55.0
+KD_ARM = 2.5
 KP_HAND = 1.5
 KD_HAND = 0.2
 N_HAND_MOTORS_PER_HAND = 7
@@ -63,7 +64,11 @@ def _hand_motor_mode(motor_id, status=0x01, timeout=0):
     return ((motor_id & 0x0F) | ((status & 0x07) << 4)
             | ((timeout & 0x01) << 7))
 CONTROL_DT = 0.02
-MOVE_TO_START_DURATION = 3.0
+MOVE_TO_START_MIN_SEC = 4.0
+MOVE_TO_START_MAX_SEC = 12.0
+MOVE_TO_START_SEC_PER_RAD = 10.0
+ENGAGE_ARM_SEC = 3.0
+SETTLE_AT_START_SEC = 0.6
 
 # Match teach_poses / dex3_close_hands
 OPEN_HAND_Q = [0.0] * N_HAND_MOTORS_PER_HAND
@@ -286,7 +291,27 @@ class TrajectoryPlayer:
             pos[j] = float(ls.motor_state[j].q)
         return pos
 
-    def _send_arm_cmd(self, positions, weight=1.0):
+    @staticmethod
+    def _arm_pose_distance(a: dict, b: dict) -> float:
+        return max(abs(a[j] - b[j]) for j in ARM_JOINTS)
+
+    def _move_to_start_duration(self, current: dict, target: dict) -> float:
+        dist = self._arm_pose_distance(current, target)
+        return max(
+            MOVE_TO_START_MIN_SEC,
+            min(
+                MOVE_TO_START_MAX_SEC,
+                MOVE_TO_START_SEC_PER_RAD * dist,
+            ),
+        )
+
+    def _send_arm_cmd(
+        self,
+        positions,
+        weight=1.0,
+        kp_scale: float = 1.0,
+        kd_scale: float = 1.0,
+    ):
         """Publish arm_sdk command with gravity-compensated arm positions."""
         ls = self._low_state()
         if ls is None:
@@ -299,6 +324,8 @@ class TrajectoryPlayer:
         if self.grav_comp and ls:
             grav = self.grav_comp.compute(ls)
 
+        arm_kp = KP_ARM * kp_scale
+        arm_kd = KD_ARM * kd_scale
         for j in ARM_JOINTS:
             cmd.motor_cmd[j].mode = 1
             cmd.motor_cmd[j].q = float(
@@ -306,9 +333,11 @@ class TrajectoryPlayer:
             )
             cmd.motor_cmd[j].dq = 0.0
             cmd.motor_cmd[j].tau = grav.get(j, 0.0)
-            cmd.motor_cmd[j].kp = KP_ARM
-            cmd.motor_cmd[j].kd = KD_ARM
+            cmd.motor_cmd[j].kp = arm_kp
+            cmd.motor_cmd[j].kd = arm_kd
 
+        waist_kp = KP_ARM * kp_scale
+        waist_kd = KD_ARM * kd_scale
         for j in WAIST_JOINTS:
             cmd.motor_cmd[j].mode = 1
             cmd.motor_cmd[j].q = float(
@@ -316,8 +345,8 @@ class TrajectoryPlayer:
             )
             cmd.motor_cmd[j].dq = 0.0
             cmd.motor_cmd[j].tau = grav.get(j, 0.0)
-            cmd.motor_cmd[j].kp = KP_ARM
-            cmd.motor_cmd[j].kd = KD_ARM
+            cmd.motor_cmd[j].kp = waist_kp
+            cmd.motor_cmd[j].kd = waist_kd
 
         cmd.crc = self.crc.Crc(cmd)
         self.arm_sdk_pub.Write(cmd)
@@ -423,7 +452,15 @@ class TrajectoryPlayer:
         """Stop playback (safe from Gradio / worker threads)."""
         self._stop = True
 
-    def play(self):
+    def play(self, release_at_end: bool = True):
+        """Play the trajectory.
+
+        release_at_end:
+          True  — Phase 4 ramps arm_sdk weight 1→0 (standalone replay).
+          False — Skip weight release; just hold last frame stiffly so the
+                  arms don't fall before the next snippet / teach hand-off.
+                  Used by sequence_player between snippets.
+        """
         self._stop = False
         # Gradio invokes callbacks off the main thread; signal only works there.
         if threading.current_thread() is threading.main_thread():
@@ -440,42 +477,145 @@ class TrajectoryPlayer:
         target_hand = self._sample_hand(0.0)
         end_left, end_right = self._hand_targets_from_dict(target_hand)
 
-        if self.has_hands:
-            self._close_hands()
+        move_dur = self._move_to_start_duration(current_arm, target_arm)
+        dist = self._arm_pose_distance(current_arm, target_arm)
 
-        # Phase 1: Enable arm_sdk with ramping weight (fingers stay closed)
-        print("\nEngaging arm control...")
-        steps = int(2.0 / CONTROL_DT)
-        for i in range(steps):
-            if self._stop:
-                return
-            w = smooth_ratio(i / steps)
-            self._send_arm_cmd(current_arm, weight=w)
-            if self.has_hands:
-                self._send_dual_hand_cmds(
-                    CLOSED_LEFT_HAND_Q, CLOSED_RIGHT_HAND_Q,
-                    kp=CLOSE_HAND_KP, kd=CLOSE_HAND_KD,
-                )
-            time.sleep(CONTROL_DT)
+        # Fast handoff: arms close enough to trajectory start (typical
+        # between snippets, or right after Prepare/Stop where the recorded
+        # step begins at forward). Skip the close-engage-move-settle-open
+        # dance, just lock onto first frame at weight=1 and start playing.
+        # Threshold is generous because between-step arm drift of even
+        # ~0.3 rad still doesn't need a safety close-fingers cycle.
+        fast_handoff = (
+            self._recorder is not None
+            and dist <= 0.35
+        )
+        # In execute mode (recorder attached) we never need to actively
+        # close fingers between snippets — operators want the visual
+        # continuity of fingers-open throughout the transition. Standalone
+        # replay keeps the safety close-then-open dance.
+        execute_mode = self._recorder is not None
 
-        # Phase 2: Move to start; open fingers closed -> target while moving
-        print("Moving to start (opening hands)...")
-        steps = int(MOVE_TO_START_DURATION / CONTROL_DT)
-        for i in range(steps):
-            if self._stop:
-                return
-            s = smooth_ratio(i / steps)
-            blended = lerp_frame(current_arm, target_arm, s)
-            self._send_arm_cmd(blended)
-            if self.has_hands:
-                left = self._lerp_hand_q(CLOSED_LEFT_HAND_Q, end_left, s)
-                right = self._lerp_hand_q(CLOSED_RIGHT_HAND_Q, end_right, s)
-                self._send_dual_hand_cmds(
-                    left, right,
-                    kp=KP_HAND * max(s, 0.15),
-                    kd=KD_HAND,
+        if fast_handoff:
+            print(
+                f"\nReplay: Δstart={dist:.2f} rad — fast handoff "
+                "(already at trajectory start)."
+            )
+            quick_steps = max(1, int(0.35 / CONTROL_DT))
+            for _ in range(quick_steps):
+                if self._stop:
+                    return
+                self._send_arm_cmd(
+                    target_arm,
+                    weight=1.0,
+                    kp_scale=0.95,
+                    kd_scale=0.95,
                 )
-            time.sleep(CONTROL_DT)
+                if self.has_hands:
+                    self._send_dual_hand_cmds(
+                        end_left, end_right,
+                        kp=KP_HAND, kd=KD_HAND,
+                    )
+                time.sleep(CONTROL_DT)
+        else:
+            print(
+                f"\nReplay: Δstart={dist:.2f} rad — "
+                f"slow move to first frame ({move_dur:.1f}s)"
+                + (
+                    " (fingers open throughout)."
+                    if execute_mode else
+                    " (fingers closed for safety)."
+                )
+            )
+
+            # Decide finger policy for the slow approach phases:
+            #   execute_mode (between snippets) -> ALWAYS open
+            #   standalone replay -> safety close/open dance
+            if self.has_hands and not execute_mode:
+                print("  Closing fingers before move to start...")
+                self._close_hands()
+
+            def _send_approach_hands():
+                if not self.has_hands:
+                    return
+                if execute_mode:
+                    self._send_dual_hand_cmds(
+                        end_left, end_right,
+                        kp=KP_HAND, kd=KD_HAND,
+                    )
+                else:
+                    self._send_dual_hand_cmds(
+                        CLOSED_LEFT_HAND_Q, CLOSED_RIGHT_HAND_Q,
+                        kp=CLOSE_HAND_KP, kd=CLOSE_HAND_KD,
+                    )
+
+            # Phase 1: Engage arm_sdk at current pose.
+            # CRITICAL: arm_sdk weight stays at 1.0 the whole time so the
+            # locomotion controller never takes arms back to "hands at
+            # sides" (would cause a violent drop+recover). Only ramp
+            # kp/kd while arm_sdk always holds authority.
+            print("  Engaging arm control at current pose...")
+            steps = max(1, int(ENGAGE_ARM_SEC / CONTROL_DT))
+            engage_kp_start = 0.55
+            for i in range(steps):
+                if self._stop:
+                    return
+                s = smooth_ratio((i + 1) / steps)
+                gain_scale = engage_kp_start + (1.0 - engage_kp_start) * s
+                self._send_arm_cmd(
+                    current_arm,
+                    weight=1.0,
+                    kp_scale=gain_scale,
+                    kd_scale=gain_scale,
+                )
+                _send_approach_hands()
+                time.sleep(CONTROL_DT)
+
+            # Phase 2: Slow move to trajectory start
+            hands_label = "open" if execute_mode else "closed"
+            print(f"  Moving to trajectory start (fingers {hands_label})...")
+            steps = max(1, int(move_dur / CONTROL_DT))
+            for i in range(steps):
+                if self._stop:
+                    return
+                s = smooth_ratio((i + 1) / steps)
+                blended = lerp_frame(current_arm, target_arm, s)
+                self._send_arm_cmd(
+                    blended,
+                    kp_scale=0.85,
+                    kd_scale=0.85,
+                )
+                _send_approach_hands()
+                time.sleep(CONTROL_DT)
+
+            settle_steps = max(1, int(SETTLE_AT_START_SEC / CONTROL_DT))
+            for _ in range(settle_steps):
+                self._send_arm_cmd(target_arm, kp_scale=0.9, kd_scale=0.9)
+                _send_approach_hands()
+                time.sleep(CONTROL_DT)
+
+            # Standalone replay: ramp fingers from closed -> trajectory's
+            # first-frame hand state for the safety handoff into playback.
+            # Execute mode already had fingers at end_left/end_right, so
+            # skip the open ramp entirely.
+            if self.has_hands and not execute_mode:
+                print("  Opening hands for playback...")
+                open_steps = max(1, int(0.8 / CONTROL_DT))
+                for i in range(open_steps):
+                    s = smooth_ratio((i + 1) / open_steps)
+                    self._send_arm_cmd(target_arm)
+                    left = self._lerp_hand_q(
+                        CLOSED_LEFT_HAND_Q, end_left, s,
+                    )
+                    right = self._lerp_hand_q(
+                        CLOSED_RIGHT_HAND_Q, end_right, s,
+                    )
+                    self._send_dual_hand_cmds(
+                        left, right,
+                        kp=KP_HAND * max(s, 0.15),
+                        kd=KD_HAND,
+                    )
+                    time.sleep(CONTROL_DT)
 
         # Phase 3: Play trajectory
         print("Playing trajectory...")
@@ -487,7 +627,7 @@ class TrajectoryPlayer:
             arm_pos = self._sample_arm(traj_t)
             hand_pos = self._sample_hand(traj_t)
 
-            self._send_arm_cmd(arm_pos)
+            self._send_arm_cmd(arm_pos, kp_scale=0.92, kd_scale=0.92)
             self._send_hand_cmd(hand_pos)
 
             time.sleep(CONTROL_DT)
@@ -501,16 +641,35 @@ class TrajectoryPlayer:
 
         print("  100.0% done!")
 
-        # Phase 4: Smoothly release arm_sdk + hands
-        print("Releasing control...")
         last_arm = self._sample_arm(self.duration)
         last_hand = self._sample_hand(self.duration)
+
+        if not release_at_end:
+            # Hold last frame stiffly at weight=1 — caller (sequence_player
+            # or teach hand-off) will take over arm_sdk next. Releasing
+            # weight here would let locomotion pull arms to "hands at sides"
+            # between snippets, causing a violent fall + recover.
+            print("Holding last frame (no release — caller takes over)...")
+            hold_steps = max(1, int(0.4 / CONTROL_DT))
+            for _ in range(hold_steps):
+                if self._stop:
+                    break
+                self._send_arm_cmd(last_arm, weight=1.0, kp_scale=0.95,
+                                   kd_scale=0.95)
+                if last_hand is not None:
+                    self._send_hand_cmd(last_hand)
+                time.sleep(CONTROL_DT)
+            print("Snippet done — arms held at last frame.")
+            return
+
+        # Phase 4: Smoothly release arm_sdk + hands (standalone replay)
+        print("Releasing control...")
         steps = int(2.0 / CONTROL_DT)
         for i in range(steps):
             if self._stop:
                 break
-            w = 1.0 - smooth_ratio(i / steps)
-            self._send_arm_cmd(last_arm, weight=w)
+            w = 1.0 - smooth_ratio((i + 1) / steps)
+            self._send_arm_cmd(last_arm, weight=w, kp_scale=max(0.2, w))
             if last_hand is not None:
                 self._send_hand_cmd(
                     last_hand, kp_scale=w

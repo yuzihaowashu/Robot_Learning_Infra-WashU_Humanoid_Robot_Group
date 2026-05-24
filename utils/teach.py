@@ -160,7 +160,13 @@ from teach_poses import (
     PARK_FORWARD_SEC,
     PREPARE_CLEARANCE_SEC,
     PREPARE_CLOSE_HANDS_SEC,
+    PREPARE_ENGAGE_SEC,
     PREPARE_FORWARD_SEC,
+    PREPARE_POST_CLOSE_HOLD_SEC,
+    PREPARE_UI_CLEARANCE_SEC,
+    PREPARE_UI_ENGAGE_SEC,
+    PREPARE_UI_FORWARD_SEC,
+    PREPARE_UI_SETTLE_SEC,
     BETWEEN_STEPS_COMPLIANT_RAMP_SEC,
     BETWEEN_STEPS_FORWARD_SEC,
     BETWEEN_STEPS_OPEN_HANDS_SEC,
@@ -663,6 +669,27 @@ class TeachRecorder:
             kp=CLOSE_HAND_KP, kd=CLOSE_HAND_KD,
         )
 
+    def _prepare_close_hands_before_moves(self) -> dict:
+        """Close fists and hold current arm pose before any prepare motion."""
+        arm_hold = self._get_arm_positions()
+        if self.record_hands:
+            print("  Closing fingers before arm moves...")
+            self._close_hands(hold_arm_pose=arm_hold)
+            self._hold_pose_settle(
+                arm_hold,
+                PREPARE_POST_CLOSE_HOLD_SEC,
+                "Fingers closed — holding still",
+                hands_closed=True,
+            )
+        else:
+            self._hold_pose_settle(
+                arm_hold,
+                PREPARE_POST_CLOSE_HOLD_SEC * 0.5,
+                "Holding still before move",
+                hands_closed=False,
+            )
+        return self._get_arm_positions()
+
     def _ramp_arm_to(
         self,
         target: dict,
@@ -671,21 +698,37 @@ class TeachRecorder:
         *,
         hold_hands_closed: bool = False,
         open_hands_to_forward: bool = False,
+        hold_hands_open: bool = False,
+        arm_kp_scale: float = 1.0,
     ):
-        """Smooth stiff hold to a target arm pose; optional hand close/open."""
+        """Smooth stiff hold to a target arm pose; optional hand close/open.
+
+        hold_hands_closed: fingers stay closed (safety for big moves through
+            the body envelope, e.g. Prepare from a random pose).
+        open_hands_to_forward: fingers ramp from closed→open along the move
+            (used at the tail of Prepare so fingers open at forward).
+        hold_hands_open: fingers stay OPEN throughout the move (used for
+            small between-step returns to forward where the operator just
+            released the arm at drag-teach; closing & re-opening is wasteful
+            and confusing for the user).
+        """
         if not self.low_state:
             return
         self.lock_waist()
         current = self._get_arm_positions()
         steps = max(1, int(duration / RECORD_DT))
-        print(f"  {label}...")
+        print(f"  {label} ({duration:.1f}s)...")
         for i in range(steps):
-            s = _smooth_ratio(i / steps)
+            s = _smooth_ratio((i + 1) / steps)
             blended = {
                 j: current[j] + (target[j] - current[j]) * s
                 for j in ARM_JOINTS
             }
-            self._send_arm_hold_cmd(blended)
+            self._send_arm_hold_cmd(
+                blended,
+                kp_scale=arm_kp_scale,
+                kd_scale=max(0.2, arm_kp_scale),
+            )
             if self.record_hands:
                 if hold_hands_closed:
                     self._send_dual_hand_cmds(
@@ -703,6 +746,11 @@ class TeachRecorder:
                         left, right,
                         kp=OPEN_HAND_KP * max(s, 0.15),
                         kd=OPEN_HAND_KD,
+                    )
+                elif hold_hands_open:
+                    self._send_dual_hand_cmds(
+                        OPEN_HAND_Q, OPEN_HAND_Q,
+                        kp=OPEN_HAND_KP, kd=OPEN_HAND_KD,
                     )
             time.sleep(RECORD_DT)
         if self.record_hands and open_hands_to_forward:
@@ -739,10 +787,52 @@ class TeachRecorder:
                     )
             time.sleep(RECORD_DT)
 
-    def _ramp_stiff_to_compliant(self, hold_pose: dict, duration: float):
-        """Gradually reduce arm stiffness into drag-teach (avoids sudden drop)."""
+    def _engage_arm_sdk_ramp(
+        self,
+        hold_pose: dict | None = None,
+        duration: float = PREPARE_ENGAGE_SEC,
+    ) -> None:
+        """Take over arm_sdk at current pose (no sudden jerk).
+
+        CRITICAL: arm_sdk weight stays at 1.0 the whole time. Dropping the
+        weight to 0 would hand arms back to the locomotion controller, which
+        immediately pulls them to its default "hands at sides" pose — that
+        caused a visible "fall to downward, then recover to forward" right
+        before recording / between steps. Only ramp kp/kd (gain) so the
+        takeover is smooth while arm_sdk always holds authority.
+        """
         if not self.low_state:
             return
+        if hold_pose is None:
+            hold_pose = self._get_arm_positions()
+        self.lock_waist()
+        steps = max(1, int(duration / RECORD_DT))
+        print(f"  Engaging arm_sdk over {duration:.1f}s (hold current pose)...")
+        kp_start = 0.5
+        for i in range(steps):
+            s = _smooth_ratio((i + 1) / steps)
+            gain = kp_start + (1.0 - kp_start) * s
+            self._send_arm_hold_cmd(
+                hold_pose,
+                weight=1.0,
+                kp_scale=gain,
+                kd_scale=gain,
+            )
+            time.sleep(RECORD_DT)
+        for _ in range(int(0.5 / RECORD_DT)):
+            self._send_arm_hold_cmd(hold_pose, kp_scale=0.9, kd_scale=0.9)
+            time.sleep(RECORD_DT)
+
+    def _ramp_stiff_to_compliant(
+        self,
+        hold_pose: dict | None = None,
+        duration: float = COMPLIANT_RAMP_SEC,
+    ):
+        """Gradually reduce stiffness at the *achieved* pose (not forced q=0)."""
+        if not self.low_state:
+            return
+        if hold_pose is None:
+            hold_pose = self._get_arm_positions()
         steps = max(1, int(duration / RECORD_DT))
         print(f"  Engaging compliant mode over {duration:.1f}s...")
         for i in range(steps):
@@ -756,14 +846,119 @@ class TeachRecorder:
                 self._send_hand_passive()
             time.sleep(RECORD_DT)
 
+    def _finish_prepare_to_compliant(
+        self,
+        resume_compliant: bool,
+    ) -> None:
+        """Open hands, then drag-teach at current joint angles."""
+        self._open_hands_at_forward_hold()
+        if self.record_hands:
+            self._prime_hand_passive(FORWARD_ARM_POSE)
+        if resume_compliant:
+            achieved = self._get_arm_positions()
+            self._ramp_stiff_to_compliant(achieved, COMPLIANT_RAMP_SEC)
+            print("Starting compliant drag-teach loop...")
+            self.begin_compliant_session()
+
+    def _prepare_at_forward(
+        self,
+        resume_compliant: bool,
+        *,
+        forward_sec: float,
+        settle_sec: float,
+    ) -> bool:
+        """Near forward — small slow adjustment only (no spread path)."""
+        print("  Near forward — slow adjust only (spread path skipped).")
+        arm_hold = self._get_arm_positions()
+        if self._arm_pose_distance(arm_hold, FORWARD_ARM_POSE) > 0.06:
+            self._ramp_arm_to(
+                FORWARD_ARM_POSE, forward_sec,
+                "Slow adjust to forward (fingers closed)",
+                hold_hands_closed=True,
+                arm_kp_scale=0.85,
+            )
+        else:
+            self._hold_pose_settle(
+                arm_hold, settle_sec,
+                "Already at forward (fingers closed)",
+                hands_closed=True,
+            )
+        self._hold_pose_settle(
+            FORWARD_ARM_POSE, settle_sec,
+            "Settling at forward (fingers closed)",
+            hands_closed=True,
+        )
+        self._finish_prepare_to_compliant(resume_compliant)
+        print("Ready to record.")
+        return True
+
+    def _prepare_forward_only(
+        self,
+        resume_compliant: bool,
+        *,
+        forward_sec: float,
+        settle_sec: float,
+    ) -> bool:
+        """At spread — slow move to forward; fingers already closed."""
+        print("  At spread — slow forward only (fingers closed).")
+        self._ramp_arm_to(
+            FORWARD_ARM_POSE, forward_sec,
+            "Forward (fingers closed)",
+            hold_hands_closed=True,
+            arm_kp_scale=0.85,
+        )
+        self._hold_pose_settle(
+            FORWARD_ARM_POSE, settle_sec,
+            "At forward (fingers closed)",
+            hands_closed=True,
+        )
+        self._finish_prepare_to_compliant(resume_compliant)
+        print("Ready to record.")
+        return True
+
+    def _prepare_via_spread(
+        self,
+        resume_compliant: bool,
+        *,
+        clearance_sec: float,
+        forward_sec: float,
+        settle_sec: float,
+    ) -> bool:
+        """Outward spread, then forward; hands closed throughout."""
+        print("  Full prepare: slow spread, then slow forward.")
+        arm_hold = self._get_arm_positions()
+        if self._arm_pose_distance(arm_hold, SPREAD_ARM_POSE) > 0.15:
+            self._ramp_arm_to(
+                SPREAD_ARM_POSE, clearance_sec,
+                "Outward clearance (fingers closed)",
+                hold_hands_closed=True,
+                arm_kp_scale=0.85,
+            )
+        self._ramp_arm_to(
+            FORWARD_ARM_POSE, forward_sec,
+            "Forward (fingers closed)",
+            hold_hands_closed=True,
+            arm_kp_scale=0.85,
+        )
+        self._hold_pose_settle(
+            FORWARD_ARM_POSE, settle_sec,
+            "At forward (fingers closed)",
+            hands_closed=True,
+        )
+        self._finish_prepare_to_compliant(resume_compliant)
+        print("Ready to record.")
+        return True
+
     def prepare_recording_pose(
         self,
         resume_compliant: bool = True,
         quick: bool = False,
+        ui_prepare: bool = False,
     ):
-        """Teleop-style prepare: spread clearance -> forward q=0 -> open hands.
+        """Safe prepare: engage → (optional spread) → forward → drag.
 
-        If quick=True and already near forward, skip spread park (between steps).
+        Picks the shortest safe path from the current pose. Hands stay closed
+        during arm moves; open only after settling at forward.
         """
         if quick and self.is_near_forward_pose():
             return self._prepare_recording_quick(resume_compliant)
@@ -774,39 +969,56 @@ class TeachRecorder:
             print("ERROR: No robot state for prepare pose.")
             return False
 
-        print("Preparing teleop forward recording pose...")
-        self.lock_waist()
-        arm_hold = self._get_arm_positions()
-        if self.record_hands:
-            self._close_hands(hold_arm_pose=arm_hold)
-        self._ramp_arm_to(
-            SPREAD_ARM_POSE, PREPARE_CLEARANCE_SEC,
-            "Outward clearance (fingers closed)",
-            hold_hands_closed=True,
+        current = self._get_arm_positions()
+        dist_fwd = self._arm_pose_distance(current, FORWARD_ARM_POSE)
+        dist_spread = self._arm_pose_distance(current, SPREAD_ARM_POSE)
+        engage_sec = (
+            PREPARE_UI_ENGAGE_SEC if ui_prepare else PREPARE_ENGAGE_SEC
         )
-        self._ramp_arm_to(
-            FORWARD_ARM_POSE, PREPARE_FORWARD_SEC,
-            "Forward default (q=0), opening hands",
-            open_hands_to_forward=True,
+        clearance_sec = (
+            PREPARE_UI_CLEARANCE_SEC if ui_prepare else PREPARE_CLEARANCE_SEC
         )
-        self._hold_pose_settle(
-            FORWARD_ARM_POSE, SETTLE_AT_FORWARD_SEC,
-            "Settling at forward pose",
+        forward_sec = (
+            PREPARE_UI_FORWARD_SEC if ui_prepare else PREPARE_FORWARD_SEC
         )
-        if self.record_hands:
-            self._prime_hand_passive(FORWARD_ARM_POSE)
+        settle_sec = (
+            PREPARE_UI_SETTLE_SEC if ui_prepare else SETTLE_AT_FORWARD_SEC
+        )
+        print(
+            f"Preparing recording pose (Δforward={dist_fwd:.2f}, "
+            f"Δspread={dist_spread:.2f} rad, forward {forward_sec:.0f}s)..."
+        )
 
-        if resume_compliant:
-            self._ramp_stiff_to_compliant(
-                FORWARD_ARM_POSE, COMPLIANT_RAMP_SEC,
+        self._engage_arm_sdk_ramp(current, duration=engage_sec)
+        self._prepare_close_hands_before_moves()
+
+        # Route selection rules (safety > speed):
+        #   - "Near forward" branch (skip spread clearance) ONLY when truly
+        #     within tolerance of FORWARD_ARM_POSE. The old "dist_fwd <
+        #     dist_spread" trick was wrong: from a sagging / dropped pose,
+        #     arms can be ~1 rad from forward yet still "closer to forward
+        #     than spread", which then pulled them inward and crashed the
+        #     body. Always require dist_fwd <= FORWARD_POSE_TOLERANCE.
+        #   - "Forward only" when already at spread (no need to spread again).
+        #   - Otherwise full prepare: spread → forward (safest path).
+        if dist_fwd <= FORWARD_POSE_TOLERANCE:
+            return self._prepare_at_forward(
+                resume_compliant,
+                forward_sec=forward_sec,
+                settle_sec=settle_sec,
             )
-            self._send_teach_cmd()
-            if self.record_hands:
-                self._send_hand_passive()
-            print("Starting compliant drag-teach loop...")
-            self.begin_compliant_session()
-        print("Ready to record from forward pose.")
-        return True
+        if dist_spread <= 0.15:
+            return self._prepare_forward_only(
+                resume_compliant,
+                forward_sec=forward_sec,
+                settle_sec=settle_sec,
+            )
+        return self._prepare_via_spread(
+            resume_compliant,
+            clearance_sec=clearance_sec,
+            forward_sec=forward_sec,
+            settle_sec=settle_sec,
+        )
 
     @staticmethod
     def _arm_pose_distance(a: dict, b: dict) -> float:
@@ -848,43 +1060,86 @@ class TeachRecorder:
             kp=OPEN_HAND_KP, kd=OPEN_HAND_KD,
         )
 
-    def hold_forward_between_steps(self):
-        """After saving a step: close hands, stay at forward, ready for next step."""
+    def begin_step_recording(self) -> bool:
+        """At forward (stiff): ramp to drag-teach and start background loop."""
+        if not self.low_state:
+            print("ERROR: No robot state.")
+            return False
+        if self._session_thread and self._session_thread.is_alive():
+            self.suspend_compliant_session()
+        achieved = self._get_arm_positions()
+        self._ramp_stiff_to_compliant(achieved, COMPLIANT_RAMP_SEC)
+        self.begin_compliant_session()
+        print("Drag-teach active — move arms freely.")
+        return True
+
+    def hold_forward_between_steps(self, enable_drag: bool = False):
+        """After save / between steps: return to forward, FINGERS OPEN.
+
+        Fingers stay open throughout. The previous close→move→open cycle
+        was unnecessary here because between-step motion is small and
+        slow, and operators found the open/close gymnastics confusing.
+        For larger / less predictable moves (e.g. Prepare from a random
+        pose) the close-fingers safety path is still used elsewhere.
+        """
         if not self.low_state:
             print("ERROR: No robot state.")
             return False
 
-        print("Holding forward pose for next step...")
+        print("Returning to forward between steps (fingers open)...")
         if self._session_thread and self._session_thread.is_alive():
             self.suspend_compliant_session()
 
         self.lock_waist()
-        arm_hold = self._get_arm_positions()
+
+        # Drive fingers open at the current pose first (in case drag-teach
+        # left them in some non-open state). Active arm hold at weight=1.
         if self.record_hands:
-            self._close_hands(hold_arm_pose=arm_hold)
+            arm_hold = self._get_arm_positions()
+            steps = max(1, int(0.4 / RECORD_DT))
+            for _ in range(steps):
+                self._send_arm_hold_cmd(arm_hold)
+                self._send_dual_hand_cmds(
+                    OPEN_HAND_Q, OPEN_HAND_Q,
+                    kp=OPEN_HAND_KP, kd=OPEN_HAND_KD,
+                )
+                time.sleep(RECORD_DT)
 
         if not self.is_near_forward_pose():
             self._ramp_arm_to(
                 FORWARD_ARM_POSE, BETWEEN_STEPS_FORWARD_SEC,
-                "Return to forward (fingers closed)",
-                hold_hands_closed=True,
+                "Return to forward (fingers open)",
+                hold_hands_open=True,
             )
         else:
             self._send_arm_hold_cmd(FORWARD_ARM_POSE)
+            if self.record_hands:
+                self._send_dual_hand_cmds(
+                    OPEN_HAND_Q, OPEN_HAND_Q,
+                    kp=OPEN_HAND_KP, kd=OPEN_HAND_KD,
+                )
 
         self._hold_pose_settle(
             FORWARD_ARM_POSE, SETTLE_AT_FORWARD_SEC * 0.5,
-            "Ready at forward for next step",
-            hands_closed=True,
+            "At forward (stiff, fingers open)",
+            hands_closed=False,
         )
-        self._ramp_stiff_to_compliant(
-            FORWARD_ARM_POSE, BETWEEN_STEPS_COMPLIANT_RAMP_SEC,
-        )
-        self._send_teach_cmd()
-        if self.record_hands:
-            self._send_hand_passive()
-        self.begin_compliant_session()
-        print("At forward — ready to record next step.")
+        if enable_drag:
+            self._ramp_stiff_to_compliant(
+                self._get_arm_positions(), BETWEEN_STEPS_COMPLIANT_RAMP_SEC,
+            )
+            self.begin_compliant_session()
+            print("At forward — drag-teach ready.")
+        else:
+            for _ in range(int(0.5 / RECORD_DT)):
+                self._send_arm_hold_cmd(FORWARD_ARM_POSE)
+                if self.record_hands:
+                    self._send_dual_hand_cmds(
+                        OPEN_HAND_Q, OPEN_HAND_Q,
+                        kp=OPEN_HAND_KP, kd=OPEN_HAND_KD,
+                    )
+                time.sleep(RECORD_DT)
+            print("At forward (stiff, fingers open) — click Record Step N or Execute.")
         return True
 
     def _prepare_recording_quick(self, resume_compliant: bool) -> bool:
@@ -915,11 +1170,8 @@ class TeachRecorder:
 
         if resume_compliant:
             self._ramp_stiff_to_compliant(
-                FORWARD_ARM_POSE, BETWEEN_STEPS_COMPLIANT_RAMP_SEC,
+                self._get_arm_positions(), BETWEEN_STEPS_COMPLIANT_RAMP_SEC,
             )
-            self._send_teach_cmd()
-            if self.record_hands:
-                self._send_hand_passive()
             self.begin_compliant_session()
         print("Ready to record from forward pose.")
         return True

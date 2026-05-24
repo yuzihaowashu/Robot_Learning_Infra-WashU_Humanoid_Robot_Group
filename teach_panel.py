@@ -45,6 +45,18 @@ from teach import (  # noqa: E402
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # noqa: E402
 
 DEFAULT_PORT = 7861
+MAX_RECORD_STEP_BTNS = 12
+
+RECORDING_BTN_CSS = """
+button.step-recording {
+    background-color: #22c55e !important;
+    border-color: #16a34a !important;
+    color: #ffffff !important;
+}
+button.step-recording:hover {
+    background-color: #16a34a !important;
+}
+"""
 
 
 class TeachUISession:
@@ -54,6 +66,7 @@ class TeachUISession:
         self.lock = threading.Lock()
         self.recorder: TeachRecorder | None = None
         self.connected = False
+        self.forward_ready = False
         self.arms_compliant = False
         self.prepared = False
         self.replay_busy = False
@@ -110,10 +123,12 @@ class TeachUISession:
                     return self.log_text()
 
                 self.connected = True
+                self.forward_ready = False
                 self.arms_compliant = False
                 self.prepared = False
                 self._append_log(
-                    "Connected. Set a goal, then click **Record Step N**."
+                    "Connected. Click **Prepare (forward pose)**, "
+                    "then **Record Step N**."
                 )
             except Exception as e:
                 self.recorder = None
@@ -122,30 +137,131 @@ class TeachUISession:
                 self._append_log(traceback.format_exc())
             return self.log_text()
 
-    def disconnect(self) -> str:
+    def _release_robot_control(self) -> None:
+        """Slowly release arm_sdk from the current pose (relax)."""
+        if not self.recorder or not self.recorder.low_state:
+            return
+        if self.recorder.recording:
+            self.recorder.stop_recording()
+        if (
+            self.recorder._session_thread
+            and self.recorder._session_thread.is_alive()
+        ):
+            self.recorder.suspend_compliant_session()
+        hold = self.recorder._get_arm_positions()
+        self.recorder._release_arm_control(hold_pose=hold)
+
+    def _relax_orphaned(self, network: str, record_hands: bool) -> str:
+        """Release when UI session was reset but the robot still holds pose."""
+        try:
+            self._init_dds(network)
+            self._append_log(
+                "No active UI session — releasing arm_sdk anyway..."
+            )
+            grav = GravityCompensator()
+            rec = TeachRecorder(
+                record_hands=record_hands,
+                grav_comp=grav,
+            )
+            rec.init()
+            if not rec.wait_for_state(timeout=4.0):
+                self._append_log(
+                    "ERROR: No robot state. Connect, then try again."
+                )
+                rec.close_channels()
+                return self.log_text()
+            rec._release_arm_control(
+                hold_pose=rec._get_arm_positions(),
+            )
+            rec.close_channels()
+            self._append_log(
+                "Arm control released. Click **Connect** before next teach."
+            )
+        except Exception as e:
+            self._append_log(f"Relax failed: {e}")
+            self._append_log(traceback.format_exc())
+        return self.log_text()
+
+    def disconnect(self, network: str, record_hands: bool) -> str:
         with self.lock:
             if not self.connected or not self.recorder:
-                self._append_log("Not connected.")
-                return self.log_text()
+                return self._relax_orphaned(network, record_hands)
             try:
-                if self.recorder.recording:
-                    self.recorder.stop_recording()
-                if self.arms_compliant or self.prepared:
-                    self.recorder.finish_recording_session()
-                elif self.recorder.low_state:
-                    self.recorder._disable_arm_sdk()
-                self._append_log("Disconnected — arm control released.")
+                self._release_robot_control()
+                self._append_log(
+                    "Disconnected & relaxed — arm control released."
+                )
             except Exception as e:
                 self._append_log(f"Disconnect error: {e}")
+                self._append_log(traceback.format_exc())
             finally:
                 if self.recorder:
                     self.recorder.close_channels()
                 self.recorder = None
                 self.connected = False
+                self.forward_ready = False
                 self.arms_compliant = False
                 self.prepared = False
                 self.current_goal = None
                 self.recording_step = None
+            return self.log_text()
+
+    def step_button_updates(self) -> list:
+        """Gradio updates: green highlight on the step currently recording."""
+        out = []
+        for n in range(1, MAX_RECORD_STEP_BTNS + 1):
+            if n == self.recording_step:
+                out.append(
+                    gr.update(variant="primary", elem_classes=["step-recording"])
+                )
+            else:
+                out.append(gr.update(variant="secondary", elem_classes=[]))
+        return out
+
+    def prepare_forward(self) -> str:
+        """Move arms to forward pose (stiff). Required before recording."""
+        with self.lock:
+            if not self.connected or not self.recorder:
+                self._append_log("Connect to the robot first.")
+                return self.log_text()
+            if self.replay_busy:
+                self._append_log("Wait for replay to finish.")
+                return self.log_text()
+            if self.recorder.recording:
+                self._append_log("Stop & save the current step first.")
+                return self.log_text()
+            try:
+                self._append_log(
+                    "Prepare: close hands first, then slow move to "
+                    "forward (stiff, ~20s)..."
+                )
+                self._append_log(
+                    "Stop gradio_panel.py teleop if it is still running."
+                )
+                if self.recorder._session_thread and (
+                    self.recorder._session_thread.is_alive()
+                ):
+                    self.recorder.suspend_compliant_session()
+                ok = self.recorder.prepare_recording_pose(
+                    resume_compliant=False,
+                    quick=False,
+                    ui_prepare=True,
+                )
+                if not ok:
+                    self.forward_ready = False
+                    self._append_log("Prepare failed.")
+                    return self.log_text()
+                self.forward_ready = True
+                self.prepared = True
+                self.arms_compliant = False
+                self._append_log(
+                    "Forward pose ready (stiff). "
+                    "You may click **Record Step N**."
+                )
+            except Exception as e:
+                self.forward_ready = False
+                self._append_log(f"Prepare failed: {e}")
+                self._append_log(traceback.format_exc())
             return self.log_text()
 
     def _steps_table(self) -> str:
@@ -188,6 +304,11 @@ class TeachUISession:
             if self.recorder.recording:
                 self._append_log("Stop & save the current step first.")
                 return self.log_text()
+            if not self.forward_ready:
+                self._append_log(
+                    "Click **Prepare (forward pose)** before recording."
+                )
+                return self.log_text()
             step = int(step_num)
             max_n = int(self.current_goal.get("max_steps", DEFAULT_MAX_STEPS))
             if step < 1 or step > max_n:
@@ -198,20 +319,18 @@ class TeachUISession:
             try:
                 self._append_log(
                     f'Recording **Step {step}** for "{goal_title}" — '
-                    "prepare, then move the robot..."
+                    "entering drag-teach..."
                 )
-                quick = self.prepared and self.arms_compliant
-                ok = self.recorder.prepare_recording_pose(
-                    resume_compliant=True,
-                    quick=quick,
-                )
+                ok = self.recorder.begin_step_recording()
                 if not ok:
                     self.recording_step = None
-                    self._append_log("Prepare failed.")
+                    self._append_log("Could not start drag-teach.")
                     return self.log_text()
                 self.arms_compliant = True
-                self.prepared = True
-                self.recorder.start_recording()
+                if not self.recorder.start_recording():
+                    self.recording_step = None
+                    self._append_log("Already recording.")
+                    return self.log_text()
                 label = (step_name or "").strip() or f"step {step}"
                 self._append_log(
                     f'**Recording step {step}** ({label}) — '
@@ -258,12 +377,13 @@ class TeachUISession:
             self._append_log(
                 "Closing fingers and holding forward for next step..."
             )
-            self.recorder.hold_forward_between_steps()
-            self.arms_compliant = True
+            self.recorder.hold_forward_between_steps(enable_drag=False)
+            self.arms_compliant = False
+            self.forward_ready = True
             self.prepared = True
             self._append_log(
-                f'Step {step} saved. Still at forward — '
-                "click Record Step N+1 or Execute goal."
+                f'Step {step} saved. At forward (stiff) — '
+                f"click Record Step {step + 1} or Execute goal."
             )
             return self.log_text()
 
@@ -300,14 +420,21 @@ class TeachUISession:
             if self.recorder and self.recorder.recording:
                 self._append_log("Stop recording before execute.")
                 return self.log_text()
-            if self.recorder and self.arms_compliant:
-                self.recorder.suspend_compliant_session()
+            if self.recorder:
+                if (
+                    self.recorder._session_thread
+                    and self.recorder._session_thread.is_alive()
+                ):
+                    self.recorder.suspend_compliant_session()
                 self.arms_compliant = False
             self.replay_busy = True
 
         est = estimate_sequence_duration(paths, float(pause_sec))
         self._append_log(
             f'Execute "{data["name"]}": {len(paths)} steps, ~{est:.1f}s'
+        )
+        self._append_log(
+            "Replay: slow move to 1st frame only (no spread→forward prepare)."
         )
         try:
             if not self._dds_init:
@@ -316,13 +443,22 @@ class TeachUISession:
                 paths,
                 speed=float(speed),
                 pause_sec=float(pause_sec),
-                clearance_between=bool(clearance_between),
+                clearance_between=False,
                 recorder=self.recorder,
-                prepare_first=True,
+                prepare_first=False,
+                return_to_forward_at_end=True,
                 log=self._append_log,
             )
-            self.prepared = False
+            # After execute, arms are returned to forward (stiff). Mark UI
+            # state so user can immediately Record Step N or Execute again
+            # without clicking Prepare a second time.
+            self.prepared = True
+            self.forward_ready = True
             self.arms_compliant = False
+            self._append_log(
+                "Execute done — at forward (stiff). Ready for next "
+                "Record or Execute."
+            )
         except Exception as e:
             self._append_log(f"Execute failed: {e}")
             self._append_log(traceback.format_exc())
@@ -349,15 +485,28 @@ def build_ui() -> gr.Blocks:
             value=labels[0] if labels else None,
         )
 
-    def on_connect(network, record_hands):
-        return SESSION.connect(network, record_hands)
+    def _ui_after_session(*, goal_select=None):
+        parts = [SESSION.log_text(), SESSION._steps_table()]
+        if goal_select is not None:
+            parts.append(goal_select)
+        parts.extend(SESSION.step_button_updates())
+        return tuple(parts)
 
-    def on_disconnect():
-        return SESSION.disconnect(), SESSION._steps_table()
+    def on_connect(network, record_hands):
+        SESSION.connect(network, record_hands)
+        return _ui_after_session()
+
+    def on_disconnect(network, record_hands):
+        SESSION.disconnect(network, record_hands)
+        return _ui_after_session(goal_select=refresh_goal_dropdown())
+
+    def on_prepare():
+        SESSION.prepare_forward()
+        return _ui_after_session()
 
     def on_use_goal(goal_name, max_steps):
-        log = SESSION.use_goal(goal_name, max_steps)
-        return log, SESSION._steps_table(), refresh_goal_dropdown()
+        SESSION.use_goal(goal_name, max_steps)
+        return _ui_after_session(goal_select=refresh_goal_dropdown())
 
     def on_load_goal(goal_label):
         path = goal_label_to_path.get(goal_label or "")
@@ -380,18 +529,19 @@ def build_ui() -> gr.Blocks:
             data.get("name", ""),
             int(data.get("max_steps", DEFAULT_MAX_STEPS)),
             float(data.get("pause_sec", 0.5)),
-            bool(data.get("clearance_between", True)),
+            bool(data.get("clearance_between", False)),
+            *SESSION.step_button_updates(),
         )
 
     def on_record_step(step_num, goal_name, max_steps, step_label):
         if not SESSION.current_goal:
             SESSION.use_goal(goal_name, max_steps)
-        log = SESSION.record_step(step_num, step_label)
-        return log, SESSION._steps_table()
+        SESSION.record_step(step_num, step_label)
+        return _ui_after_session()
 
     def on_stop_save(step_label):
-        log = SESSION.stop_save_step(step_label)
-        return log, SESSION._steps_table(), refresh_goal_dropdown()
+        SESSION.stop_save_step(step_label)
+        return _ui_after_session(goal_select=refresh_goal_dropdown())
 
     def on_execute(goal_label, goal_name, max_steps, speed, pause_sec, clearance):
         path = goal_label_to_path.get(goal_label or "")
@@ -400,28 +550,47 @@ def build_ui() -> gr.Blocks:
         if not path and (goal_name or "").strip():
             SESSION.use_goal(goal_name, max_steps)
             path = SESSION.current_goal.get("path") if SESSION.current_goal else None
-        log = SESSION.execute_goal(path, speed, pause_sec, clearance)
-        return log, SESSION._steps_table()
+        SESSION.execute_goal(path, speed, pause_sec, clearance)
+        return _ui_after_session()
 
     def on_refresh():
-        return (
-            SESSION.log_text(),
-            SESSION._steps_table(),
-            refresh_goal_dropdown(),
-        )
+        return _ui_after_session(goal_select=refresh_goal_dropdown())
 
     with gr.Blocks(
         title="G1 Drag-and-Teach",
         theme=gr.themes.Soft(),
+        css=RECORDING_BTN_CSS,
     ) as demo:
         gr.Markdown(
             "# G1 Drag-and-Teach — Goals & Steps\n\n"
-            "1. **Connect** to the robot.\n"
-            "2. Enter a **high-level goal** (e.g. *prepare a drink*) → **Use goal**.\n"
-            "3. Click **Record Step 1, 2, 3…** — move the robot → **Stop & save step**.\n"
-            "4. Select the goal and click **Execute goal** to run all recorded steps.\n\n"
+            "1. **Connect** to the robot → **Prepare (forward pose)**.\n"
+            "2. Enter a **high-level goal** → **Use goal**.\n"
+            "3. **Record Step N** (green while recording) → drag-teach → "
+            "**Stop & save step**.\n"
+            "4. **Execute goal** to replay all steps.\n\n"
             "**Prerequisites:** Robot in `ai` balance mode (L1+A → L1+UP).\n\n"
             "**Do not run `gradio_panel.py` at the same time** (shared `rt/arm_sdk`)."
+        )
+
+        gr.Markdown("### Robot")
+        with gr.Row():
+            network = gr.Textbox(
+                label="Network interface (optional)",
+                placeholder="e.g. enp2s0",
+                lines=1,
+                scale=2,
+            )
+            record_hands = gr.Checkbox(
+                label="Record Dex3 hands",
+                value=True,
+                scale=1,
+            )
+        with gr.Row():
+            connect_btn = gr.Button("Connect", variant="primary")
+            disconnect_btn = gr.Button("Disconnect & Relax")
+        prepare_btn = gr.Button(
+            "Prepare (forward pose)",
+            variant="primary",
         )
 
         with gr.Row():
@@ -450,19 +619,6 @@ def build_ui() -> gr.Blocks:
                 steps_md = gr.Markdown(
                     format_goal_steps_table(None),
                 )
-
-                gr.Markdown("### Robot")
-                network = gr.Textbox(
-                    label="Network interface (optional)",
-                    placeholder="e.g. enp2s0",
-                    lines=1,
-                )
-                record_hands = gr.Checkbox(
-                    label="Record Dex3 hands",
-                    value=True,
-                )
-                connect_btn = gr.Button("Connect", variant="primary")
-                disconnect_btn = gr.Button("Disconnect")
 
             with gr.Column(scale=1):
                 gr.Markdown("### Record steps")
@@ -513,8 +669,11 @@ def build_ui() -> gr.Blocks:
                         label="Pause between steps (s)",
                     )
                 exec_clearance = gr.Checkbox(
-                    label="Outward clearance between steps",
-                    value=True,
+                    label=(
+                        "Outward clearance between steps "
+                        "(unsafe — leave off; ignored during Execute)"
+                    ),
+                    value=False,
                 )
                 execute_btn = gr.Button(
                     "Execute goal", variant="primary",
@@ -528,19 +687,27 @@ def build_ui() -> gr.Blocks:
             interactive=False,
         )
 
+        ui_outputs = [log_box, steps_md, *step_btns]
+        ui_outputs_with_goal = [log_box, steps_md, goal_select, *step_btns]
+
         connect_btn.click(
             on_connect,
             inputs=[network, record_hands],
-            outputs=log_box,
+            outputs=ui_outputs,
         )
         disconnect_btn.click(
             on_disconnect,
-            outputs=[log_box, steps_md],
+            inputs=[network, record_hands],
+            outputs=ui_outputs_with_goal,
+        )
+        prepare_btn.click(
+            on_prepare,
+            outputs=ui_outputs,
         )
         use_goal_btn.click(
             on_use_goal,
             inputs=[goal_name, max_steps],
-            outputs=[log_box, steps_md, goal_select],
+            outputs=ui_outputs_with_goal,
         )
         load_goal_btn.click(
             on_load_goal,
@@ -548,12 +715,13 @@ def build_ui() -> gr.Blocks:
             outputs=[
                 log_box, steps_md, goal_name, max_steps,
                 exec_pause, exec_clearance,
+                *step_btns,
             ],
         )
         stop_save_btn.click(
             on_stop_save,
             inputs=[step_label],
-            outputs=[log_box, steps_md, goal_select],
+            outputs=ui_outputs_with_goal,
         )
         execute_btn.click(
             on_execute,
@@ -561,20 +729,19 @@ def build_ui() -> gr.Blocks:
                 goal_select, goal_name, max_steps,
                 exec_speed, exec_pause, exec_clearance,
             ],
-            outputs=[log_box, steps_md],
+            outputs=ui_outputs,
         )
         refresh_btn.click(
             on_refresh,
-            outputs=[log_box, steps_md, goal_select],
+            outputs=ui_outputs_with_goal,
         )
 
         record_inputs = [goal_name, max_steps, step_label]
-        record_outputs = [log_box, steps_md]
         for i, btn in enumerate(step_btns, start=1):
             btn.click(
                 lambda gn, ms, sl, n=i: on_record_step(n, gn, ms, sl),
                 inputs=record_inputs,
-                outputs=record_outputs,
+                outputs=ui_outputs,
             )
 
     return demo

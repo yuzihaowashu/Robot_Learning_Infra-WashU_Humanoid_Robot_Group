@@ -32,13 +32,24 @@ OPEN_HAND_Q = [0.0] * 7
 CLOSED_LEFT_HAND_Q = [0.0, 1.0, 1.74, -1.57, -1.74, -1.57, -1.74]
 CLOSED_RIGHT_HAND_Q = [0.0, -1.0, -1.74, 1.57, 1.74, 1.57, 1.74]
 
-PREPARE_CLOSE_HANDS_SEC = 0.5
-# Slower arm moves — reduces inward swing into the torso.
+PREPARE_CLOSE_HANDS_SEC = 0.7
+# Hold closed fists at current pose before any arm waypoint move.
+PREPARE_POST_CLOSE_HOLD_SEC = 0.5
+# Ramp arm_sdk in at current pose before any waypoint (avoids sudden takeover).
+PREPARE_ENGAGE_SEC = 2.0
+# Arm moves — fast enough to feel snappy but slow enough to stay safely
+# outside the torso envelope.
 PREPARE_CLEARANCE_SEC = 3.5
-PREPARE_FORWARD_SEC = 4.5
+PREPARE_FORWARD_SEC = 5.0
+# UI "Prepare" button — slightly slower / smoother than in-step prepare,
+# but still snappy. Total ~14s for a full spread→forward prepare.
+PREPARE_UI_ENGAGE_SEC = 2.5
+PREPARE_UI_CLEARANCE_SEC = 4.0
+PREPARE_UI_FORWARD_SEC = 6.5
+PREPARE_UI_SETTLE_SEC = 1.0
 # Hold forward stiff before engaging drag-teach (avoids sudden drop).
-SETTLE_AT_FORWARD_SEC = 0.8
-COMPLIANT_RAMP_SEC = 2.5
+SETTLE_AT_FORWARD_SEC = 1.0
+COMPLIANT_RAMP_SEC = 4.0
 # Park / release after Stop & save (slower than prepare — safe outward retreat).
 PARK_FORWARD_SEC = 4.0
 PARK_CLEARANCE_SEC = 5.0
